@@ -1,49 +1,61 @@
 # rax-cli
 
-Zero-dependency, **agent-ready** CLI for **Rax** (Cloud LLM Channel Control Tower) — written in pure Go (no Python, no Node.js, no `az` CLI required).
+Standalone, zero-dependency CLI for [Rax](https://rax.72ray.com) cloud tenant onboarding and verification.
 
-## Install
+- **Zero runtime dependencies**: single static Go binary — no Python, no Node.js, no `az` CLI required.
+- **Zero plaintext secret on disk**: onboarding bundles are sealed in memory using **RSA-OAEP-256 + AES-256-GCM** with Rax's platform public key (`keyId: rax-onboard-v1`) and saved to `~/Downloads/rax-cli/rax-<slug>-<timestamp>.rax.enc.json` (`0600`). Only Rax Console can decrypt `clientSecret`.
+- **AI Agent-Ready**: `--agent` NDJSON event streaming, `rax agent-info` machine-readable schema, `rax doctor --json` preflight, and standardized exit codes (`0/1/2/3/4`).
+- **Platforms**: macOS (`arm64` / `amd64`) via Homebrew, Linux (`amd64` / `arm64`) via install script or GitHub Releases.
+
+## Install & Upgrade
 
 ### macOS (Homebrew)
+
 ```bash
 brew install larrykoo711/tap/rax
+# Upgrade later:
+brew upgrade larrykoo711/tap/rax
 ```
 
-### Linux / macOS (curl)
+### Linux
+
 ```bash
 curl -fsSL https://raw.githubusercontent.com/larrykoo711/rax-cli/main/install.sh | sh
-```
-
-## AI Agent Readiness (Claude Code / Codex / OpenCode / Any Harness)
-
-`rax` is built first-class for AI coding agents acting on behalf of an operator:
-- **`rax agent-info`** — emits machine-readable command schemas, exit codes (`0/1/2/3/4`), and zero-secret-leakage rules.
-- **`--agent` / `RAX_AGENT=1`** — switches `rax azure onboard` to line-flushed **NDJSON** on stdout (`step`, `device_code`, `done`, `error`), so agents immediately detect `verificationUri` + `userCode` and relay them to the user.
-- **`rax doctor --json`** — 1-second preflight verifying HTTPS reachability to Entra, Graph, and ARM endpoints.
-- **Zero secret leakage**: raw `clientSecret` is written strictly to the `chmod 600` bundle file and is never emitted to stdout/stderr.
-
-```bash
-rax azure onboard --slug prod --secret-days 365 --output ./rax-onboard-bundle.json --agent --apply
-rax azure verify --bundle ./rax-onboard-bundle.json --json
-```
-
-## Human Terminal Usage
-
-```bash
-# Dry-run preview (zero Azure writes)
-rax azure onboard --slug prod
-
-# Live Device Code onboarding (auto-discovers all enabled subscriptions)
-rax azure onboard --slug prod --secret-days 365 --output ./rax-onboard-bundle.json --apply
-
-# Verify Service Principal tokens & visible subscriptions
-rax azure verify --bundle ./rax-onboard-bundle.json
-
-# Preflight & self-upgrade
-rax doctor
-rax version
+# Upgrade later:
 rax upgrade
 ```
 
-## License
-MIT
+## Quick Start
+
+### 1. Onboard an Azure Tenant (Native Device Code → Encrypted Bundle)
+
+```bash
+# Dry-run plan (zero Azure writes)
+rax azure onboard --slug hailiang01
+
+# Live onboarding: Device Code login -> auto-discover enabled subscriptions
+# -> create single-tenant SP + 4 read roles + custom least-privilege freeze role
+# -> self-verify in memory -> save encrypted bundle to ~/Downloads/rax-cli/
+rax azure onboard --slug hailiang01 --secret-days 365 --apply
+```
+
+Upload the generated `~/Downloads/rax-cli/rax-hailiang01-*.rax.enc.json` file in **Rax Console → Azure → 租户与订阅 → 接入租户 (Step 2)**.
+
+### 2. AI Agent Readiness (Claude Code / Codex / OpenCode)
+
+```bash
+# Machine-readable CLI schema, exit codes, and security boundary
+rax agent-info
+
+# Environment & Entra/Graph/ARM HTTPS connectivity preflight
+rax doctor --json
+
+# Line-flushed NDJSON event stream (step / device_code / done / error)
+rax azure onboard --slug hailiang01 --secret-days 365 --agent --apply
+```
+
+### 3. Validate a Sealed Bundle Envelope
+
+```bash
+rax azure verify --bundle ~/Downloads/rax-cli/rax-hailiang01-*.rax.enc.json --json
+```

@@ -155,7 +155,7 @@ func TestOnboardApplyAutoDiscoversSubscriptionsAndWritesChmod600Bundle(t *testin
 	}
 
 	tmpDir := t.TempDir()
-	bundlePath := filepath.Join(tmpDir, "rax-onboard-bundle.json")
+	bundlePath := filepath.Join(tmpDir, "rax-demo.rax.enc.json")
 
 	var events []OnboardEvent
 	sum, err := ob.Run(context.Background(), OnboardOptions{
@@ -178,7 +178,7 @@ func TestOnboardApplyAutoDiscoversSubscriptionsAndWritesChmod600Bundle(t *testin
 	if !hasDeviceCodeEvent {
 		t.Fatalf("expected structured device_code event in agent mode, got %+v", events)
 	}
-	if !sum.Applied || sum.TenantID != tenantID || sum.ClientID != "app-client-1" {
+	if !sum.Applied || !sum.Sealed || !sum.Verified || sum.TenantID != tenantID || sum.ClientID != "app-client-1" {
 		t.Fatalf("unexpected summary: %+v", sum)
 	}
 	if sum.SecretMasked != "***9876" {
@@ -203,13 +203,18 @@ func TestOnboardApplyAutoDiscoversSubscriptionsAndWritesChmod600Bundle(t *testin
 		t.Fatalf("expected chmod 0600, got %o", info.Mode().Perm())
 	}
 
-	// Verify round-trip LoadBundleCredentials + Verify()
-	creds, err := LoadBundleCredentials(bundlePath)
+	// Ensure plaintext secret NEVER appears on disk in the default sealed bundle!
+	rawOnDisk, err := os.ReadFile(bundlePath)
 	if err != nil {
-		t.Fatalf("load bundle: %v", err)
+		t.Fatalf("read bundle: %v", err)
 	}
-	vres, err := ob.Verify(context.Background(), *creds)
-	if err != nil || !vres.OK || !vres.ARMTokenOK || !vres.MonitorOK || len(vres.Subscriptions) != 2 {
-		t.Fatalf("verify failed: res=%+v err=%v", vres, err)
+	if strings.Contains(string(rawOnDisk), "super-secret-value-9876") {
+		t.Fatalf("plaintext clientSecret leaked to disk in sealed bundle!")
+	}
+
+	// Verify sealed envelope inspection succeeds cleanly.
+	sealedRes, isSealed, err := InspectSealedBundle(bundlePath)
+	if err != nil || !isSealed || !sealedRes.OK || !sealedRes.VerifiedAtOnboard {
+		t.Fatalf("InspectSealedBundle failed: res=%+v sealed=%v err=%v", sealedRes, isSealed, err)
 	}
 }

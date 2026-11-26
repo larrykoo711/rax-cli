@@ -54,9 +54,11 @@ func (a App) runAgentInfo() int {
 			"nodejs":   false,
 			"azureCli": false,
 		},
+		"defaultOutputDir": "~/Downloads/rax-cli",
+		"bundleEncryption": "RSA-OAEP-256+A256GCM (sealed with Rax platform public key; zero plaintext clientSecret on disk)",
 		"securityRules": []string{
-			"NEVER read, print, or paste raw clientSecret from rax-onboard-bundle.json into chat or logs.",
-			"After onboarding succeeds, run `rax azure verify --bundle <path> --json` and instruct the human to upload the file directly in Rax Console.",
+			"Default onboarding writes an RSA-OAEP+AES-256-GCM sealed bundle to ~/Downloads/rax-cli/rax-<slug>-<timestamp>.rax.enc.json; plaintext clientSecret never touches disk.",
+			"Only the Rax Console server can decrypt the sealed bundle. After onboarding succeeds, report the saved file path and subscription list so the user can upload it in Rax Console.",
 			"Device Code OAuth tokens stay strictly in process memory; zero files are written to ~/.azure.",
 		},
 		"exitCodes": map[string]int{
@@ -69,18 +71,18 @@ func (a App) runAgentInfo() int {
 		"commands": []map[string]any{
 			{
 				"command": "rax azure onboard",
-				"purpose": "Native Entra Device Code onboarding: auto-discovers enabled subscriptions, provisions single-tenant SP + least-privilege RBAC, writes chmod-600 bundle JSON.",
-				"agentInvocation": "rax azure onboard --slug <slug> --secret-days <7|30|90|180|365> --output ./rax-onboard-bundle.json --agent --apply",
+				"purpose": "Native Entra Device Code onboarding: auto-discovers enabled subscriptions, provisions single-tenant SP + least-privilege RBAC, self-verifies in memory, and writes a sealed encrypted bundle to ~/Downloads/rax-cli/.",
+				"agentInvocation": "rax azure onboard --slug <slug> --secret-days <7|30|90|180|365> --agent --apply",
 				"agentProtocol": map[string]any{
-					"format": "NDJSON on stdout (one JSON object per line, flushed immediately)",
-					"events": []string{"step", "device_code", "done", "error"},
+					"format":             "NDJSON on stdout (one JSON object per line, flushed immediately)",
+					"events":             []string{"step", "device_code", "done", "error"},
 					"actionOnDeviceCode": "Relay verificationUri and userCode to the human immediately and wait for the process to finish.",
 				},
 			},
 			{
 				"command":         "rax azure verify",
-				"purpose":         "Verify SP ARM + Monitor Data Plane tokens and list ARM-visible subscriptions.",
-				"agentInvocation": "rax azure verify --bundle ./rax-onboard-bundle.json --json",
+				"purpose":         "Validate sealed bundle envelope integrity (or live-verify explicit credentials).",
+				"agentInvocation": "rax azure verify --bundle ~/Downloads/rax-cli/<file>.rax.enc.json --json",
 			},
 			{
 				"command":         "rax doctor",

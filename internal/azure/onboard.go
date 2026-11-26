@@ -29,15 +29,18 @@ type OnboardEvent struct {
 
 // OnboardOptions controls the Device Code onboarding workflow.
 type OnboardOptions struct {
-	TenantID       string
-	Slug           string
-	Subscriptions  []string
-	FreezeRoleMode string // "custom" (default) | "builtin"
-	SecretDays     int
-	Apply          bool
-	OutputPath     string
-	NowUTC         func() time.Time
-	Log            io.Writer
+	TenantID         string
+	Slug             string
+	Subscriptions    []string
+	FreezeRoleMode   string // "custom" (default) | "builtin"
+	SecretDays       int
+	Apply            bool
+	OutputPath       string
+	PlainOutput      bool // Opt-in plaintext export for local debugging; default writes RSA-OAEP+AES-256-GCM sealed bundle.
+	SealKeyID        string
+	SealPublicKeyPEM string
+	NowUTC           func() time.Time
+	Log              io.Writer
 	// OnEvent receives structured progress events (including device_code).
 	// When set, agents can react immediately to verification_uri + user_code.
 	OnEvent func(OnboardEvent)
@@ -70,6 +73,9 @@ type OnboardSummary struct {
 	OK              bool                        `json:"ok"`
 	Applied         bool                        `json:"applied"`
 	Mode            string                      `json:"mode"`
+	Sealed          bool                        `json:"sealed"`
+	KeyID           string                      `json:"keyId,omitempty"`
+	Verified        bool                        `json:"verified"`
 	TenantID        string                      `json:"tenantId"`
 	Slug            string                      `json:"slug"`
 	AppName         string                      `json:"appName"`
@@ -182,17 +188,20 @@ func (o *Onboarder) Run(ctx context.Context, opts OnboardOptions) (*OnboardSumma
 				Roles:          roles,
 			})
 		}
+		plannedOut := ResolveOutputPath(opts.OutputPath, slug, nowFn().UTC(), opts.PlainOutput)
 		return &OnboardSummary{
 			OK:             true,
 			Applied:        false,
 			Mode:           "dry-run",
+			Sealed:         !opts.PlainOutput,
+			KeyID:          effectiveKeyID(opts.SealKeyID, opts.PlainOutput),
 			TenantID:       strings.TrimSpace(opts.TenantID),
 			Slug:           slug,
 			AppName:        appName,
 			FreezeRoleMode: freezeMode,
 			RolesPerSub:    roles,
 			Subscriptions:  plannedSubs,
-			OutputPath:     opts.OutputPath,
+			OutputPath:     plannedOut,
 		}, nil
 	}
 
@@ -322,7 +331,16 @@ func (o *Onboarder) Run(ctx context.Context, opts OnboardOptions) (*OnboardSumma
 		})
 	}
 
-	// Step 5: Write chmod-600 bundle file for direct Rax Console import.
+	// Step 5: Self-verify SP tokens in-memory (best-effort) before sealing, then write encrypted bundle to ~/Downloads/rax-cli/.
+	verified := false
+	if vRes, vErr := o.Verify(ctx, VerifyCredentials{
+		TenantID:     resolvedTenantID,
+		ClientID:     app.AppID,
+		ClientSecret: cred.SecretText,
+	}); vErr == nil && vRes != nil && vRes.OK {
+		verified = true
+	}
+
 	bundle := OnboardBundle{
 		Schema:          "rax-azure-tenant-bundle/v1",
 		TenantID:        resolvedTenantID,
@@ -336,21 +354,35 @@ func (o *Onboarder) Run(ctx context.Context, opts OnboardOptions) (*OnboardSumma
 		Subscriptions:   assigned,
 	}
 
-	outPath := strings.TrimSpace(opts.OutputPath)
-	if outPath != "" {
-		if err := writeSecureBundle(outPath, bundle); err != nil {
+	outPath := ResolveOutputPath(opts.OutputPath, slug, now, opts.PlainOutput)
+	sealedMode := !opts.PlainOutput
+	keyID := effectiveKeyID(opts.SealKeyID, opts.PlainOutput)
+
+	if sealedMode {
+		sealedDoc, err := SealBundle(bundle, verified, now, keyID, opts.SealPublicKeyPEM)
+		if err != nil {
+			return nil, fmt.Errorf("seal onboarding bundle: %w", err)
+		}
+		if err := writeSecureJSON(outPath, sealedDoc); err != nil {
 			return nil, err
 		}
-		emit(OnboardEvent{Event: "step", Step: "5/5", OutputPath: outPath, Message: "Wrote chmod-600 onboarding bundle"})
-		fmt.Fprintf(logOut, "[5/5] Wrote chmod-600 onboarding bundle to %s\n", outPath)
+		emit(OnboardEvent{Event: "step", Step: "5/5", OutputPath: outPath, Message: "Wrote RSA-OAEP+AES-256-GCM sealed onboarding bundle"})
+		fmt.Fprintf(logOut, "[5/5] Wrote encrypted bundle (only Rax Console can decrypt) to %s\n", outPath)
 	} else {
-		fmt.Fprintf(logOut, "[5/5] Provisioning complete.\n")
+		if err := writeSecureJSON(outPath, bundle); err != nil {
+			return nil, err
+		}
+		emit(OnboardEvent{Event: "step", Step: "5/5", OutputPath: outPath, Message: "Wrote chmod-600 plaintext onboarding bundle"})
+		fmt.Fprintf(logOut, "[5/5] Wrote chmod-600 plaintext bundle to %s\n", outPath)
 	}
 
 	return &OnboardSummary{
 		OK:              true,
 		Applied:         true,
 		Mode:            "apply",
+		Sealed:          sealedMode,
+		KeyID:           keyID,
+		Verified:        verified,
 		TenantID:        resolvedTenantID,
 		Slug:            slug,
 		AppName:         appName,
@@ -411,8 +443,18 @@ func resolveTargetSubscriptions(all []Subscription, tenantID string, explicit []
 	return out, nil
 }
 
-func writeSecureBundle(path string, bundle OnboardBundle) error {
-	raw, err := json.MarshalIndent(bundle, "", "  ")
+func effectiveKeyID(custom string, plain bool) string {
+	if plain {
+		return ""
+	}
+	if s := strings.TrimSpace(custom); s != "" {
+		return s
+	}
+	return DefaultSealKeyID
+}
+
+func writeSecureJSON(path string, payload any) error {
+	raw, err := json.MarshalIndent(payload, "", "  ")
 	if err != nil {
 		return err
 	}

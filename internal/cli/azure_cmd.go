@@ -19,8 +19,8 @@ func (a App) runAzure(ctx context.Context, args []string) int {
   rax azure <subcommand> [flags]
 
 Subcommands:
-  onboard    Run native Entra Device Code onboarding and export rax-onboard-bundle.json
-  verify     Verify Service Principal ARM + Monitor connectivity and visible subscriptions
+  onboard    Run native Entra Device Code onboarding and save an encrypted bundle to ~/Downloads/rax-cli/
+  verify     Validate a sealed bundle envelope or verify live SP ARM + Monitor connectivity
 `)
 		return ExitOK
 	}
@@ -41,16 +41,18 @@ func (a App) runAzureOnboard(ctx context.Context, args []string) int {
 	fs.SetOutput(a.Stderr)
 
 	var (
-		tenantID   string
-		slug       string
-		subsCSV    string
-		freezeRole string
-		secretDays int
-		apply      bool
-		outputPath string
-		asJSON     bool
-		agentMode  bool
-		timeout    time.Duration
+		tenantID    string
+		slug        string
+		subsCSV     string
+		freezeRole  string
+		secretDays  int
+		apply       bool
+		outputPath  string
+		plainOutput bool
+		sealKeyPath string
+		asJSON      bool
+		agentMode   bool
+		timeout     time.Duration
 	)
 
 	fs.StringVar(&tenantID, "tenant", "", "Optional Azure Entra Tenant ID (auto-detected after Device Code sign-in if omitted)")
@@ -59,7 +61,9 @@ func (a App) runAzureOnboard(ctx context.Context, args []string) int {
 	fs.StringVar(&freezeRole, "freeze-role", "custom", "Freeze role mode: 'custom' (least-privilege default) or 'builtin'")
 	fs.IntVar(&secretDays, "secret-days", 365, "Client secret validity in days (7-730)")
 	fs.BoolVar(&apply, "apply", false, "Execute live Entra & ARM provisioning (omit for dry-run preview)")
-	fs.StringVar(&outputPath, "output", "./rax-onboard-bundle.json", "Write chmod-600 onboarding bundle JSON path")
+	fs.StringVar(&outputPath, "output", "", "Optional output file or directory (defaults to ~/Downloads/rax-cli/rax-<slug>-<timestamp>.rax.enc.json)")
+	fs.BoolVar(&plainOutput, "plain", false, "Write legacy unencrypted bundle JSON instead of RSA-OAEP+AES-256-GCM sealed bundle (debug only)")
+	fs.StringVar(&sealKeyPath, "seal-key", "", "Optional path to a custom SPKI RSA public key PEM for sealing")
 	fs.BoolVar(&asJSON, "json", false, "Print structured JSON summary to stdout")
 	fs.BoolVar(&agentMode, "agent", os.Getenv("RAX_AGENT") == "1", "Emit line-flushed NDJSON progress & device_code events for AI agents")
 	fs.DurationVar(&timeout, "timeout", 15*time.Minute, "Overall operation timeout including Device Code sign-in")
@@ -99,6 +103,20 @@ func (a App) runAzureOnboard(ctx context.Context, args []string) int {
 		return ExitInvalidArg
 	}
 
+	var customPubPEM string
+	if strings.TrimSpace(sealKeyPath) != "" {
+		rawKey, err := os.ReadFile(strings.TrimSpace(sealKeyPath))
+		if err != nil {
+			if agentMode || asJSON {
+				writeNDJSON(agentError{OK: false, Event: "error", Code: "INVALID_ARGUMENT", Error: fmt.Sprintf("read --seal-key: %v", err)})
+			} else {
+				fmt.Fprintf(a.Stderr, "Error: read --seal-key: %v\n", err)
+			}
+			return ExitInvalidArg
+		}
+		customPubPEM = string(rawKey)
+	}
+
 	var subs []string
 	for _, part := range strings.Split(subsCSV, ",") {
 		if s := strings.TrimSpace(part); s != "" {
@@ -118,15 +136,17 @@ func (a App) runAzureOnboard(ctx context.Context, args []string) int {
 
 	onboarder := azure.NewOnboarder()
 	summary, err := onboarder.Run(ctx, azure.OnboardOptions{
-		TenantID:       tenantID,
-		Slug:           slug,
-		Subscriptions:  subs,
-		FreezeRoleMode: freezeRole,
-		SecretDays:     secretDays,
-		Apply:          apply,
-		OutputPath:     outputPath,
-		Log:            logWriter,
-		OnEvent:        onEvent,
+		TenantID:         tenantID,
+		Slug:             slug,
+		Subscriptions:    subs,
+		FreezeRoleMode:   freezeRole,
+		SecretDays:       secretDays,
+		Apply:            apply,
+		OutputPath:       outputPath,
+		PlainOutput:      plainOutput,
+		SealPublicKeyPEM: customPubPEM,
+		Log:              logWriter,
+		OnEvent:          onEvent,
 	})
 	if err != nil {
 		exitCode, code, hint := classifyAzureError(err)
@@ -145,14 +165,20 @@ func (a App) runAzureOnboard(ctx context.Context, args []string) int {
 	}
 
 	if agentMode {
+		nextStep := fmt.Sprintf(
+			"Encrypted bundle saved to %s (only Rax Console can decrypt). Ask the user to import it in Rax Console -> Azure -> 租户与订阅 -> 接入租户 (Step 2).",
+			summary.OutputPath,
+		)
+		if !summary.Sealed {
+			nextStep = fmt.Sprintf(
+				"Plaintext bundle saved to %s. Do NOT read or print clientSecret; ask the user to upload it in Rax Console.",
+				summary.OutputPath,
+			)
+		}
 		writeNDJSON(map[string]any{
-			"event":   "done",
-			"summary": summary,
-			"nextStep": fmt.Sprintf(
-				"Run `rax azure verify --bundle %s --json`, then ask the user to upload %s in Rax Console without printing clientSecret.",
-				summary.OutputPath,
-				summary.OutputPath,
-			),
+			"event":    "done",
+			"summary":  summary,
+			"nextStep": nextStep,
 		})
 		return ExitOK
 	}
@@ -170,6 +196,8 @@ func (a App) runAzureOnboard(ctx context.Context, args []string) int {
 		fmt.Fprintf(a.Stdout, "  Secret TTL:   %d days\n", secretDays)
 		fmt.Fprintf(a.Stdout, "  Freeze Role:  %s\n", summary.FreezeRoleMode)
 		fmt.Fprintf(a.Stdout, "  Roles / Sub:  %s\n", strings.Join(summary.RolesPerSub, ", "))
+		fmt.Fprintf(a.Stdout, "  Encryption:   %v (keyId=%s)\n", summary.Sealed, summary.KeyID)
+		fmt.Fprintf(a.Stdout, "  Output File:  %s\n", summary.OutputPath)
 		if len(summary.Subscriptions) == 0 {
 			fmt.Fprintf(a.Stdout, "  Subscriptions: auto-discover all enabled subscriptions after Device Code login\n")
 		} else {
@@ -183,15 +211,20 @@ func (a App) runAzureOnboard(ctx context.Context, args []string) int {
 	fmt.Fprintf(a.Stdout, "  Tenant ID:      %s\n", summary.TenantID)
 	fmt.Fprintf(a.Stdout, "  SP Name:        %s\n", summary.AppName)
 	fmt.Fprintf(a.Stdout, "  Client ID:      %s\n", summary.ClientID)
-	fmt.Fprintf(a.Stdout, "  Client Secret:  %s (stored only in bundle file)\n", summary.SecretMasked)
+	if summary.Sealed {
+		fmt.Fprintf(a.Stdout, "  Client Secret:  %s (RSA-OAEP+AES-256-GCM sealed; only Rax Console can decrypt)\n", summary.SecretMasked)
+	} else {
+		fmt.Fprintf(a.Stdout, "  Client Secret:  %s (stored only in bundle file)\n", summary.SecretMasked)
+	}
 	fmt.Fprintf(a.Stdout, "  Secret Expires: %s\n", summary.SecretExpiresAt)
+	fmt.Fprintf(a.Stdout, "  Self-Verified:  %v\n", summary.Verified)
 	fmt.Fprintf(a.Stdout, "  Subscriptions:  %d bound\n", len(summary.Subscriptions))
 	for _, s := range summary.Subscriptions {
 		fmt.Fprintf(a.Stdout, "    - %s (%s)\n", s.Name, s.ID)
 	}
 	if summary.OutputPath != "" {
-		fmt.Fprintf(a.Stdout, "\nNext step: upload %s in Rax Console -> Azure -> 租户与订阅 -> 接入租户\n", summary.OutputPath)
-		fmt.Fprintf(a.Stdout, "Optional check: rax azure verify --bundle %s\n", summary.OutputPath)
+		fmt.Fprintf(a.Stdout, "\nEncrypted bundle saved to:\n  %s\n", summary.OutputPath)
+		fmt.Fprintf(a.Stdout, "\nNext step: upload this file in Rax Console -> Azure -> 租户与订阅 -> 接入租户 (Step 2)\n")
 	}
 	return ExitOK
 }
@@ -208,7 +241,7 @@ func (a App) runAzureVerify(ctx context.Context, args []string) int {
 		asJSON       bool
 	)
 
-	fs.StringVar(&bundlePath, "bundle", "", "Path to rax-onboard-bundle.json")
+	fs.StringVar(&bundlePath, "bundle", "", "Path to a sealed (*.rax.enc.json) or legacy plaintext bundle file")
 	fs.StringVar(&tenantID, "tenant", "", "Azure Tenant ID (alternative to --bundle)")
 	fs.StringVar(&clientID, "client-id", "", "Service Principal Client ID")
 	fs.StringVar(&clientSecret, "client-secret", "", "Service Principal Client Secret")
@@ -219,6 +252,36 @@ func (a App) runAzureVerify(ctx context.Context, args []string) int {
 			return ExitOK
 		}
 		return ExitInvalidArg
+	}
+
+	if strings.TrimSpace(bundlePath) != "" {
+		if sealedRes, isSealed, err := azure.InspectSealedBundle(bundlePath); isSealed {
+			if err != nil {
+				if asJSON {
+					_ = json.NewEncoder(a.Stdout).Encode(agentError{OK: false, Code: "INVALID_BUNDLE", Error: err.Error()})
+				} else {
+					fmt.Fprintf(a.Stderr, "Error: %v\n", err)
+				}
+				return ExitInvalidArg
+			}
+			if asJSON {
+				enc := json.NewEncoder(a.Stdout)
+				enc.SetIndent("", "  ")
+				_ = enc.Encode(sealedRes)
+				return ExitOK
+			}
+			fmt.Fprintf(a.Stdout, "Sealed Rax bundle envelope verified:\n")
+			fmt.Fprintf(a.Stdout, "  Tenant ID:         %s\n", sealedRes.TenantID)
+			fmt.Fprintf(a.Stdout, "  Client ID:         %s\n", sealedRes.ClientID)
+			fmt.Fprintf(a.Stdout, "  Encryption Key ID: %s (%s)\n", sealedRes.KeyID, azure.SealedBundleAlg)
+			fmt.Fprintf(a.Stdout, "  Onboard Verified:  %v\n", sealedRes.VerifiedAtOnboard)
+			fmt.Fprintf(a.Stdout, "  Subscriptions:     %d\n", len(sealedRes.Subscriptions))
+			for _, s := range sealedRes.Subscriptions {
+				fmt.Fprintf(a.Stdout, "    - %s (%s)\n", s.DisplayName, s.SubscriptionID)
+			}
+			fmt.Fprintf(a.Stdout, "\n%s\n", sealedRes.Note)
+			return ExitOK
+		}
 	}
 
 	var creds azure.VerifyCredentials
