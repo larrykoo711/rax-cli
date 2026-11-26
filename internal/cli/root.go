@@ -18,19 +18,23 @@ type App struct {
 	Stderr  io.Writer
 }
 
-// Run dispatches top-level commands and returns a process exit code.
+// Run dispatches top-level commands and returns a standardized process exit code.
 func (a App) Run(ctx context.Context, args []string) int {
 	if len(args) == 0 {
 		a.printRootHelp()
-		return 0
+		return ExitOK
 	}
 
 	switch args[0] {
 	case "-h", "--help", "help":
 		a.printRootHelp()
-		return 0
+		return ExitOK
 	case "-v", "--version", "version":
 		return a.runVersion(args[1:])
+	case "agent-info", "--schema":
+		return a.runAgentInfo()
+	case "doctor":
+		return a.runDoctor(ctx, args[1:])
 	case "azure":
 		return a.runAzure(ctx, args[1:])
 	case "upgrade", "update":
@@ -38,7 +42,7 @@ func (a App) Run(ctx context.Context, args []string) int {
 	default:
 		fmt.Fprintf(a.Stderr, "Error: unknown command %q\n\n", args[0])
 		a.printRootHelp()
-		return 2
+		return ExitInvalidArg
 	}
 }
 
@@ -49,9 +53,10 @@ Usage:
   rax <command> [flags]
 
 Commands:
-  azure onboard    Interactive Entra Device Code onboarding (auto-discovers subscriptions,
-                   provisions least-privilege SP & RBAC, exports chmod-600 bundle.json)
+  azure onboard    Interactive Entra Device Code onboarding (supports --agent NDJSON stream)
   azure verify     Verify Service Principal ARM & Monitor connectivity and subscription visibility
+  doctor           Preflight check of Microsoft Entra, Graph, and ARM connectivity
+  agent-info       Print machine-readable CLI contract & security rules for AI agent harnesses
   version          Print CLI version and build metadata
   upgrade          Check GitHub Releases and upgrade rax to the latest version
 
@@ -62,7 +67,7 @@ Run 'rax <command> --help' for details on any command.
 func (a App) runVersion(args []string) int {
 	asJSON := false
 	for _, arg := range args {
-		if arg == "--json" {
+		if arg == "--json" || arg == "--agent" {
 			asJSON = true
 		}
 	}
@@ -70,15 +75,15 @@ func (a App) runVersion(args []string) int {
 		enc := json.NewEncoder(a.Stdout)
 		enc.SetIndent("", "  ")
 		_ = enc.Encode(map[string]string{
-			"version": a.Version,
+			"version": strings.TrimPrefix(a.Version, "v"),
 			"commit":  a.Commit,
 			"date":    a.Date,
 			"os":      runtime.GOOS,
 			"arch":    runtime.GOARCH,
 		})
-		return 0
+		return ExitOK
 	}
 	ver := strings.TrimPrefix(a.Version, "v")
 	fmt.Fprintf(a.Stdout, "rax %s (%s, %s, %s/%s)\n", ver, a.Commit, a.Date, runtime.GOOS, runtime.GOARCH)
-	return 0
+	return ExitOK
 }

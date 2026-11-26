@@ -5,7 +5,10 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
+	"os"
 	"strings"
+	"time"
 
 	"github.com/larrykoo711/rax-cli/internal/azure"
 )
@@ -19,7 +22,7 @@ Subcommands:
   onboard    Run native Entra Device Code onboarding and export rax-onboard-bundle.json
   verify     Verify Service Principal ARM + Monitor connectivity and visible subscriptions
 `)
-		return 0
+		return ExitOK
 	}
 
 	switch args[0] {
@@ -29,7 +32,7 @@ Subcommands:
 		return a.runAzureVerify(ctx, args[1:])
 	default:
 		fmt.Fprintf(a.Stderr, "Error: unknown azure subcommand %q\n", args[0])
-		return 2
+		return ExitInvalidArg
 	}
 }
 
@@ -46,6 +49,8 @@ func (a App) runAzureOnboard(ctx context.Context, args []string) int {
 		apply      bool
 		outputPath string
 		asJSON     bool
+		agentMode  bool
+		timeout    time.Duration
 	)
 
 	fs.StringVar(&tenantID, "tenant", "", "Optional Azure Entra Tenant ID (auto-detected after Device Code sign-in if omitted)")
@@ -56,23 +61,58 @@ func (a App) runAzureOnboard(ctx context.Context, args []string) int {
 	fs.BoolVar(&apply, "apply", false, "Execute live Entra & ARM provisioning (omit for dry-run preview)")
 	fs.StringVar(&outputPath, "output", "./rax-onboard-bundle.json", "Write chmod-600 onboarding bundle JSON path")
 	fs.BoolVar(&asJSON, "json", false, "Print structured JSON summary to stdout")
+	fs.BoolVar(&agentMode, "agent", os.Getenv("RAX_AGENT") == "1", "Emit line-flushed NDJSON progress & device_code events for AI agents")
+	fs.DurationVar(&timeout, "timeout", 15*time.Minute, "Overall operation timeout including Device Code sign-in")
 
 	if err := fs.Parse(args); err != nil {
 		if err == flag.ErrHelp {
-			return 0
+			return ExitOK
 		}
-		return 2
+		return ExitInvalidArg
+	}
+
+	if timeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, timeout)
+		defer cancel()
+	}
+
+	writeNDJSON := func(v any) {
+		raw, err := json.Marshal(v)
+		if err == nil {
+			_, _ = fmt.Fprintln(a.Stdout, string(raw))
+		}
 	}
 
 	if strings.TrimSpace(slug) == "" {
-		fmt.Fprintf(a.Stderr, "Error: --slug is required (example: rax azure onboard --slug prod --apply)\n")
-		return 2
+		if agentMode || asJSON {
+			writeNDJSON(agentError{
+				OK:    false,
+				Event: "error",
+				Code:  "INVALID_ARGUMENT",
+				Error: "--slug is required",
+				Hint:  "Pass --slug <name> (e.g. rax azure onboard --slug prod --agent --apply)",
+			})
+		} else {
+			fmt.Fprintf(a.Stderr, "Error: --slug is required (example: rax azure onboard --slug prod --apply)\n")
+		}
+		return ExitInvalidArg
 	}
 
 	var subs []string
 	for _, part := range strings.Split(subsCSV, ",") {
 		if s := strings.TrimSpace(part); s != "" {
 			subs = append(subs, s)
+		}
+	}
+
+	var logWriter io.Writer = a.Stderr
+	var onEvent func(azure.OnboardEvent)
+	if agentMode {
+		// In --agent mode, keep stdout strictly NDJSON and silence human stderr noise.
+		logWriter = io.Discard
+		onEvent = func(ev azure.OnboardEvent) {
+			writeNDJSON(ev)
 		}
 	}
 
@@ -85,18 +125,43 @@ func (a App) runAzureOnboard(ctx context.Context, args []string) int {
 		SecretDays:     secretDays,
 		Apply:          apply,
 		OutputPath:     outputPath,
-		Log:            a.Stderr,
+		Log:            logWriter,
+		OnEvent:        onEvent,
 	})
 	if err != nil {
-		fmt.Fprintf(a.Stderr, "Error: %v\n", err)
-		return 1
+		exitCode, code, hint := classifyAzureError(err)
+		if agentMode || asJSON {
+			writeNDJSON(agentError{
+				OK:    false,
+				Event: "error",
+				Code:  code,
+				Error: err.Error(),
+				Hint:  hint,
+			})
+		} else {
+			fmt.Fprintf(a.Stderr, "Error: %v\n", err)
+		}
+		return exitCode
+	}
+
+	if agentMode {
+		writeNDJSON(map[string]any{
+			"event":   "done",
+			"summary": summary,
+			"nextStep": fmt.Sprintf(
+				"Run `rax azure verify --bundle %s --json`, then ask the user to upload %s in Rax Console without printing clientSecret.",
+				summary.OutputPath,
+				summary.OutputPath,
+			),
+		})
+		return ExitOK
 	}
 
 	if asJSON {
 		enc := json.NewEncoder(a.Stdout)
 		enc.SetIndent("", "  ")
 		_ = enc.Encode(summary)
-		return 0
+		return ExitOK
 	}
 
 	if !summary.Applied {
@@ -111,7 +176,7 @@ func (a App) runAzureOnboard(ctx context.Context, args []string) int {
 			fmt.Fprintf(a.Stdout, "  Subscriptions: %d explicit\n", len(summary.Subscriptions))
 		}
 		fmt.Fprintf(a.Stdout, "\nRe-run with --apply to execute.\n")
-		return 0
+		return ExitOK
 	}
 
 	fmt.Fprintf(a.Stdout, "\nAzure tenant onboarded successfully:\n")
@@ -128,7 +193,7 @@ func (a App) runAzureOnboard(ctx context.Context, args []string) int {
 		fmt.Fprintf(a.Stdout, "\nNext step: upload %s in Rax Console -> Azure -> 租户与订阅 -> 接入租户\n", summary.OutputPath)
 		fmt.Fprintf(a.Stdout, "Optional check: rax azure verify --bundle %s\n", summary.OutputPath)
 	}
-	return 0
+	return ExitOK
 }
 
 func (a App) runAzureVerify(ctx context.Context, args []string) int {
@@ -147,21 +212,25 @@ func (a App) runAzureVerify(ctx context.Context, args []string) int {
 	fs.StringVar(&tenantID, "tenant", "", "Azure Tenant ID (alternative to --bundle)")
 	fs.StringVar(&clientID, "client-id", "", "Service Principal Client ID")
 	fs.StringVar(&clientSecret, "client-secret", "", "Service Principal Client Secret")
-	fs.BoolVar(&asJSON, "json", false, "Print JSON output")
+	fs.BoolVar(&asJSON, "json", os.Getenv("RAX_AGENT") == "1", "Print JSON output")
 
 	if err := fs.Parse(args); err != nil {
 		if err == flag.ErrHelp {
-			return 0
+			return ExitOK
 		}
-		return 2
+		return ExitInvalidArg
 	}
 
 	var creds azure.VerifyCredentials
 	if strings.TrimSpace(bundlePath) != "" {
 		loaded, err := azure.LoadBundleCredentials(bundlePath)
 		if err != nil {
-			fmt.Fprintf(a.Stderr, "Error: %v\n", err)
-			return 1
+			if asJSON {
+				_ = json.NewEncoder(a.Stdout).Encode(agentError{OK: false, Code: "INVALID_BUNDLE", Error: err.Error()})
+			} else {
+				fmt.Fprintf(a.Stderr, "Error: %v\n", err)
+			}
+			return ExitInvalidArg
 		}
 		creds = *loaded
 	} else {
@@ -173,8 +242,16 @@ func (a App) runAzureVerify(ctx context.Context, args []string) int {
 	}
 
 	if creds.TenantID == "" || creds.ClientID == "" || creds.ClientSecret == "" {
-		fmt.Fprintf(a.Stderr, "Error: provide --bundle <path> or --tenant / --client-id / --client-secret\n")
-		return 2
+		if asJSON {
+			_ = json.NewEncoder(a.Stdout).Encode(agentError{
+				OK:    false,
+				Code:  "INVALID_ARGUMENT",
+				Error: "provide --bundle <path> or --tenant / --client-id / --client-secret",
+			})
+		} else {
+			fmt.Fprintf(a.Stderr, "Error: provide --bundle <path> or --tenant / --client-id / --client-secret\n")
+		}
+		return ExitInvalidArg
 	}
 
 	onboarder := azure.NewOnboarder()
@@ -184,14 +261,16 @@ func (a App) runAzureVerify(ctx context.Context, args []string) int {
 		enc.SetIndent("", "  ")
 		_ = enc.Encode(res)
 		if err != nil {
-			return 1
+			code, _, _ := classifyAzureError(err)
+			return code
 		}
-		return 0
+		return ExitOK
 	}
 
 	if err != nil {
 		fmt.Fprintf(a.Stderr, "Verification failed: %v\n", err)
-		return 1
+		code, _, _ := classifyAzureError(err)
+		return code
 	}
 
 	fmt.Fprintf(a.Stdout, "Service Principal verification passed:\n")
@@ -203,5 +282,5 @@ func (a App) runAzureVerify(ctx context.Context, args []string) int {
 	for _, s := range res.Subscriptions {
 		fmt.Fprintf(a.Stdout, "    - %s (%s) [%s]\n", s.DisplayName, s.SubscriptionID, s.State)
 	}
-	return 0
+	return ExitOK
 }

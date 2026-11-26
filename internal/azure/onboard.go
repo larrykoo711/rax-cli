@@ -12,6 +12,21 @@ import (
 	"time"
 )
 
+// OnboardEvent is a structured NDJSON progress event emitted when AgentMode is enabled,
+// allowing AI coding agents (Claude Code, Codex, OpenCode, etc.) to parse device_code
+// prompts and step transitions deterministically without scraping human prose.
+type OnboardEvent struct {
+	Event           string `json:"event"` // "step" | "device_code" | "done" | "error"
+	Step            string `json:"step,omitempty"`
+	Message         string `json:"message,omitempty"`
+	VerificationURI string `json:"verificationUri,omitempty"`
+	UserCode        string `json:"userCode,omitempty"`
+	ExpiresIn       int    `json:"expiresIn,omitempty"`
+	TenantID        string `json:"tenantId,omitempty"`
+	Subscriptions   int    `json:"subscriptions,omitempty"`
+	OutputPath      string `json:"outputPath,omitempty"`
+}
+
 // OnboardOptions controls the Device Code onboarding workflow.
 type OnboardOptions struct {
 	TenantID       string
@@ -23,6 +38,9 @@ type OnboardOptions struct {
 	OutputPath     string
 	NowUTC         func() time.Time
 	Log            io.Writer
+	// OnEvent receives structured progress events (including device_code).
+	// When set, agents can react immediately to verification_uri + user_code.
+	OnEvent func(OnboardEvent)
 }
 
 // OnboardBundleSubscription describes a subscription bound during onboarding.
@@ -141,6 +159,11 @@ func (o *Onboarder) Run(ctx context.Context, opts OnboardOptions) (*OnboardSumma
 	if logOut == nil {
 		logOut = io.Discard
 	}
+	emit := func(ev OnboardEvent) {
+		if opts.OnEvent != nil {
+			opts.OnEvent(ev)
+		}
+	}
 
 	appName := SPDisplayName(slug)
 	roles := RequiredRoles(freezeMode)
@@ -174,11 +197,20 @@ func (o *Onboarder) Run(ctx context.Context, opts OnboardOptions) (*OnboardSumma
 	}
 
 	// Step 1: Interactive Device Code login (zero local az CLI or Python needed; tokens stay in memory only).
+	emit(OnboardEvent{Event: "step", Step: "1/5", Message: "Initiating Microsoft Entra Device Code login"})
 	fmt.Fprintf(logOut, "[1/5] Initiating Microsoft Entra Device Code login...\n")
 	dc, err := o.Auth.StartDeviceCode(ctx, opts.TenantID, ScopeARMUser)
 	if err != nil {
 		return nil, err
 	}
+	emit(OnboardEvent{
+		Event:           "device_code",
+		Step:            "1/5",
+		VerificationURI: dc.VerificationURI,
+		UserCode:        dc.UserCode,
+		ExpiresIn:       dc.ExpiresIn,
+		Message:         fmt.Sprintf("Open %s and enter code %s to sign in", dc.VerificationURI, dc.UserCode),
+	})
 	fmt.Fprintf(logOut, "\n  Open:  %s\n  Code:  %s\n\nWaiting for browser sign-in...\n", dc.VerificationURI, dc.UserCode)
 
 	armTok, err := o.Auth.PollDeviceCode(ctx, opts.TenantID, dc)
@@ -210,6 +242,7 @@ func (o *Onboarder) Run(ctx context.Context, opts OnboardOptions) (*OnboardSumma
 	}
 
 	// Step 2: Discover enabled subscriptions under this tenant (or filter to explicit list).
+	emit(OnboardEvent{Event: "step", Step: "2/5", TenantID: resolvedTenantID, Message: "Discovering enabled Azure subscriptions"})
 	fmt.Fprintf(logOut, "[2/5] Signed in to tenant %s — discovering subscriptions...\n", resolvedTenantID)
 	allSubs, err := o.ARM.ListSubscriptions(ctx, armTok.AccessToken)
 	if err != nil {
@@ -219,9 +252,11 @@ func (o *Onboarder) Run(ctx context.Context, opts OnboardOptions) (*OnboardSumma
 	if err != nil {
 		return nil, err
 	}
+	emit(OnboardEvent{Event: "step", Step: "2/5", TenantID: resolvedTenantID, Subscriptions: len(targetSubs), Message: fmt.Sprintf("Found %d target subscription(s)", len(targetSubs))})
 	fmt.Fprintf(logOut, "      Found %d target subscription(s).\n", len(targetSubs))
 
 	// Step 3: Idempotently create single-tenant App Registration, Service Principal, and Client Secret.
+	emit(OnboardEvent{Event: "step", Step: "3/5", TenantID: resolvedTenantID, Message: fmt.Sprintf("Provisioning single-tenant App & SP (%s)", appName)})
 	fmt.Fprintf(logOut, "[3/5] Provisioning single-tenant App & Service Principal (%s)...\n", appName)
 	app, _, err := o.Graph.EnsureApplication(ctx, graphTok.AccessToken, appName)
 	if err != nil {
@@ -243,6 +278,7 @@ func (o *Onboarder) Run(ctx context.Context, opts OnboardOptions) (*OnboardSumma
 	}
 
 	// Step 4: Bind 4 read roles + 1 freeze role per subscription.
+	emit(OnboardEvent{Event: "step", Step: "4/5", TenantID: resolvedTenantID, Subscriptions: len(targetSubs), Message: "Binding least-privilege RBAC roles"})
 	fmt.Fprintf(logOut, "[4/5] Binding least-privilege RBAC roles across %d subscription(s)...\n", len(targetSubs))
 	assigned := make([]OnboardBundleSubscription, 0, len(targetSubs))
 	for _, sub := range targetSubs {
@@ -305,6 +341,7 @@ func (o *Onboarder) Run(ctx context.Context, opts OnboardOptions) (*OnboardSumma
 		if err := writeSecureBundle(outPath, bundle); err != nil {
 			return nil, err
 		}
+		emit(OnboardEvent{Event: "step", Step: "5/5", OutputPath: outPath, Message: "Wrote chmod-600 onboarding bundle"})
 		fmt.Fprintf(logOut, "[5/5] Wrote chmod-600 onboarding bundle to %s\n", outPath)
 	} else {
 		fmt.Fprintf(logOut, "[5/5] Provisioning complete.\n")

@@ -157,15 +157,26 @@ func TestOnboardApplyAutoDiscoversSubscriptionsAndWritesChmod600Bundle(t *testin
 	tmpDir := t.TempDir()
 	bundlePath := filepath.Join(tmpDir, "rax-onboard-bundle.json")
 
+	var events []OnboardEvent
 	sum, err := ob.Run(context.Background(), OnboardOptions{
 		Slug:       "demo",
 		SecretDays: 7,
 		Apply:      true,
 		OutputPath: bundlePath,
 		NowUTC:     func() time.Time { return time.Date(2026, 11, 26, 0, 0, 0, 0, time.UTC) },
+		OnEvent:    func(ev OnboardEvent) { events = append(events, ev) },
 	})
 	if err != nil {
 		t.Fatalf("apply failed: %v", err)
+	}
+	hasDeviceCodeEvent := false
+	for _, ev := range events {
+		if ev.Event == "device_code" && ev.UserCode == "ABCD-1234" && ev.VerificationURI == "https://microsoft.com/devicelogin" {
+			hasDeviceCodeEvent = true
+		}
+	}
+	if !hasDeviceCodeEvent {
+		t.Fatalf("expected structured device_code event in agent mode, got %+v", events)
 	}
 	if !sum.Applied || sum.TenantID != tenantID || sum.ClientID != "app-client-1" {
 		t.Fatalf("unexpected summary: %+v", sum)
