@@ -298,7 +298,28 @@ type JWTClaims struct {
 	TenantID          string `json:"tid"`
 	UPN               string `json:"upn"`
 	PreferredUsername string `json:"preferred_username"`
+	UniqueName        string `json:"unique_name"`
+	Email             string `json:"email"`
 	Name              string `json:"name"`
+}
+
+// ResolvedEmail returns the signed-in admin email / UPN from the Entra token claims.
+func (c *JWTClaims) ResolvedEmail() string {
+	if c == nil {
+		return ""
+	}
+	for _, v := range []string{c.UPN, c.PreferredUsername, c.UniqueName, c.Email} {
+		s := strings.TrimSpace(v)
+		if strings.Contains(s, "@") {
+			return s
+		}
+	}
+	for _, v := range []string{c.UPN, c.PreferredUsername, c.UniqueName, c.Email} {
+		if s := strings.TrimSpace(v); s != "" {
+			return s
+		}
+	}
+	return ""
 }
 
 // ParseJWTClaims decodes the payload segment of a JWT without re-verifying its signature

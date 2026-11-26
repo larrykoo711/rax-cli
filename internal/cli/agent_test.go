@@ -9,7 +9,7 @@ import (
 
 func TestAgentInfoEmitsValidSchemaAndSecurityRules(t *testing.T) {
 	var out, errBuf bytes.Buffer
-	app := App{Version: "0.2.0", Commit: "abc1234", Date: "2026-11-26", Stdout: &out, Stderr: &errBuf}
+	app := App{Version: "0.6.0", Commit: "abc1234", Date: "2026-11-26", Stdout: &out, Stderr: &errBuf}
 
 	code := app.Run(context.Background(), []string{"agent-info"})
 	if code != ExitOK {
@@ -20,7 +20,7 @@ func TestAgentInfoEmitsValidSchemaAndSecurityRules(t *testing.T) {
 	if err := json.Unmarshal(out.Bytes(), &doc); err != nil {
 		t.Fatalf("invalid agent-info JSON: %v", err)
 	}
-	if doc["name"] != "rax" || doc["version"] != "0.2.0" {
+	if doc["name"] != "rax" || doc["version"] != "0.6.0" {
 		t.Fatalf("unexpected header: %+v", doc)
 	}
 	rules, ok := doc["securityRules"].([]any)
@@ -29,13 +29,21 @@ func TestAgentInfoEmitsValidSchemaAndSecurityRules(t *testing.T) {
 	}
 }
 
-func TestOnboardAgentMissingSlugEmitsStructuredJSONError(t *testing.T) {
+func TestOnboardAgentWithoutSlugSucceedsInDryRunAndRejectsBadDays(t *testing.T) {
 	var out, errBuf bytes.Buffer
-	app := App{Version: "0.2.0", Stdout: &out, Stderr: &errBuf}
+	app := App{Version: "0.6.0", Stdout: &out, Stderr: &errBuf}
 
+	// Omitting --slug is now supported (auto-derived from *.onmicrosoft.com on apply).
 	code := app.Run(context.Background(), []string{"azure", "onboard", "--agent"})
-	if code != ExitInvalidArg {
-		t.Fatalf("expected exit %d, got %d", ExitInvalidArg, code)
+	if code != ExitOK {
+		t.Fatalf("expected exit 0 without --slug, got %d (out=%s err=%s)", code, out.String(), errBuf.String())
+	}
+
+	out.Reset()
+	errBuf.Reset()
+	badCode := app.Run(context.Background(), []string{"azure", "onboard", "--secret-days", "1", "--agent"})
+	if badCode != ExitInvalidArg {
+		t.Fatalf("expected exit %d for invalid --secret-days, got %d", ExitInvalidArg, badCode)
 	}
 	var res map[string]any
 	if err := json.Unmarshal(out.Bytes(), &res); err != nil {

@@ -39,6 +39,97 @@ type PasswordCredential struct {
 	KeyID       string `json:"keyId"`
 }
 
+// OrganizationInfo holds basic Entra tenant identity discovered via Microsoft Graph.
+type OrganizationInfo struct {
+	ID            string
+	DisplayName   string
+	InitialDomain string // e.g. hailiang01.onmicrosoft.com
+	DefaultDomain string // e.g. yjintelli.com or hailiang01.onmicrosoft.com
+}
+
+// GetOrganizationInfo fetches the tenant's displayName and verifiedDomains (including *.onmicrosoft.com).
+func (g *GraphClient) GetOrganizationInfo(ctx context.Context, token string) (*OrganizationInfo, error) {
+	endpoint := fmt.Sprintf("%s/organization?$select=id,displayName,verifiedDomains", g.baseURL())
+	var resp struct {
+		Value []struct {
+			ID              string `json:"id"`
+			DisplayName     string `json:"displayName"`
+			VerifiedDomains []struct {
+				Name      string `json:"name"`
+				IsInitial bool   `json:"isInitial"`
+				IsDefault bool   `json:"isDefault"`
+			} `json:"verifiedDomains"`
+		} `json:"value"`
+	}
+	if err := g.doJSON(ctx, token, http.MethodGet, endpoint, nil, &resp); err != nil {
+		return nil, err
+	}
+	if len(resp.Value) == 0 {
+		return nil, errors.New("empty organization response")
+	}
+	org := resp.Value[0]
+	info := &OrganizationInfo{
+		ID:          strings.TrimSpace(org.ID),
+		DisplayName: strings.TrimSpace(org.DisplayName),
+	}
+	for _, d := range org.VerifiedDomains {
+		name := strings.TrimSpace(d.Name)
+		if name == "" {
+			continue
+		}
+		if d.IsInitial || (info.InitialDomain == "" && strings.HasSuffix(strings.ToLower(name), ".onmicrosoft.com")) {
+			info.InitialDomain = name
+		}
+		if d.IsDefault {
+			info.DefaultDomain = name
+		}
+	}
+	if info.DefaultDomain == "" {
+		info.DefaultDomain = info.InitialDomain
+	}
+	return info, nil
+}
+
+// DeriveTenantSlug derives a clean unique slug and canonical tenant domain automatically
+// from Entra *.onmicrosoft.com initial domain, default verified domain, or signed-in admin email.
+func DeriveTenantSlug(org *OrganizationInfo, authEmail, tenantID string) (slug string, domain string) {
+	extractSlug := func(dom string) string {
+		d := strings.ToLower(strings.TrimSpace(dom))
+		if d == "" {
+			return ""
+		}
+		if strings.HasSuffix(d, ".onmicrosoft.com") {
+			prefix := strings.TrimSuffix(d, ".onmicrosoft.com")
+			return SanitizeSlug(prefix)
+		}
+		// For custom domains like yjintelli.com, use the leftmost label.
+		label := strings.SplitN(d, ".", 2)[0]
+		return SanitizeSlug(label)
+	}
+
+	if org != nil {
+		if org.InitialDomain != "" {
+			return extractSlug(org.InitialDomain), org.InitialDomain
+		}
+		if org.DefaultDomain != "" {
+			return extractSlug(org.DefaultDomain), org.DefaultDomain
+		}
+	}
+
+	if at := strings.LastIndex(authEmail, "@"); at >= 0 && at+1 < len(authEmail) {
+		emailDom := strings.TrimSpace(authEmail[at+1:])
+		if emailDom != "" {
+			// Skip generic consumer domains (gmail.com/outlook.com/hotmail.com) as tenant slug.
+			low := strings.ToLower(emailDom)
+			if low != "gmail.com" && low != "outlook.com" && low != "hotmail.com" && low != "live.com" {
+				return extractSlug(emailDom), emailDom
+			}
+		}
+	}
+
+	return "az-" + strings.ToLower(shortID(tenantID)), ""
+}
+
 // NewGraphClient constructs a GraphClient with default v1.0 base URL.
 func NewGraphClient(httpClient *http.Client) *GraphClient {
 	if httpClient == nil {

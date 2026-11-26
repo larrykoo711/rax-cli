@@ -43,16 +43,19 @@ XwIDAQAB
 
 // SealedBundleMetadata carries non-sensitive tenant metadata authenticated via AES-GCM AAD.
 type SealedBundleMetadata struct {
-	TenantID        string                      `json:"tenantId"`
-	Slug            string                      `json:"slug"`
-	AppName         string                      `json:"appName"`
-	ClientID        string                      `json:"clientId"`
-	SPObjectID      string                      `json:"spObjectId"`
-	SecretMasked    string                      `json:"secretMasked"`
-	SecretExpiresAt string                      `json:"secretExpiresAt"`
-	FreezeRoleMode  string                      `json:"freezeRoleMode"`
-	Verified        bool                        `json:"verified"`
-	Subscriptions   []OnboardBundleSubscription `json:"subscriptions"`
+	TenantID          string                      `json:"tenantId"`
+	Slug              string                      `json:"slug"`
+	AppName           string                      `json:"appName"`
+	TenantDisplayName string                      `json:"tenantDisplayName,omitempty"`
+	TenantDomain      string                      `json:"tenantDomain,omitempty"`
+	AuthorizedByEmail string                      `json:"authorizedByEmail,omitempty"`
+	ClientID          string                      `json:"clientId"`
+	SPObjectID        string                      `json:"spObjectId"`
+	SecretMasked      string                      `json:"secretMasked"`
+	SecretExpiresAt   string                      `json:"secretExpiresAt"`
+	FreezeRoleMode    string                      `json:"freezeRoleMode"`
+	Verified          bool                        `json:"verified"`
+	Subscriptions     []OnboardBundleSubscription `json:"subscriptions"`
 }
 
 // SealedCiphertext holds the RSA-OAEP wrapped DEK, 12-byte GCM IV, and ciphertext+tag.
@@ -237,16 +240,19 @@ func SealBundle(bundle OnboardBundle, verified bool, now time.Time, keyID string
 		KeyID:     keyID,
 		CreatedAt: now.UTC().Format(time.RFC3339),
 		Metadata: SealedBundleMetadata{
-			TenantID:        bundle.TenantID,
-			Slug:            bundle.Slug,
-			AppName:         bundle.AppName,
-			ClientID:        bundle.ClientID,
-			SPObjectID:      bundle.SPObjectID,
-			SecretMasked:    MaskSecret(bundle.ClientSecret),
-			SecretExpiresAt: bundle.SecretExpiresAt,
-			FreezeRoleMode:  bundle.FreezeRoleMode,
-			Verified:        verified,
-			Subscriptions:   bundle.Subscriptions,
+			TenantID:          bundle.TenantID,
+			Slug:              bundle.Slug,
+			AppName:           bundle.AppName,
+			TenantDisplayName: bundle.TenantDisplayName,
+			TenantDomain:      bundle.TenantDomain,
+			AuthorizedByEmail: bundle.AuthorizedByEmail,
+			ClientID:          bundle.ClientID,
+			SPObjectID:        bundle.SPObjectID,
+			SecretMasked:      MaskSecret(bundle.ClientSecret),
+			SecretExpiresAt:   bundle.SecretExpiresAt,
+			FreezeRoleMode:    bundle.FreezeRoleMode,
+			Verified:          verified,
+			Subscriptions:     bundle.Subscriptions,
 		},
 		Sealed: SealedCiphertext{
 			EK: base64.StdEncoding.EncodeToString(wrappedDEK),

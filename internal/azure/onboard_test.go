@@ -103,6 +103,18 @@ func TestOnboardApplyAutoDiscoversSubscriptionsAndWritesChmod600Bundle(t *testin
 					{"subscriptionId": "sub-disabled", "displayName": "Old Sub", "state": "Disabled", "tenantId": tenantID},
 				},
 			})
+		case r.Method == http.MethodGet && r.URL.Path == "/organization":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"value": []map[string]any{
+					{
+						"id":          tenantID,
+						"displayName": "HaiLiang Cloud",
+						"verifiedDomains": []map[string]any{
+							{"name": "hailiang01.onmicrosoft.com", "isInitial": true, "isDefault": true},
+						},
+					},
+				},
+			})
 		case r.Method == http.MethodGet && r.URL.Path == "/applications":
 			_ = json.NewEncoder(w).Encode(map[string]any{"value": []any{}})
 		case r.Method == http.MethodPost && r.URL.Path == "/applications":
@@ -172,7 +184,7 @@ func TestOnboardApplyAutoDiscoversSubscriptionsAndWritesChmod600Bundle(t *testin
 
 	var events []OnboardEvent
 	sum, err := ob.Run(context.Background(), OnboardOptions{
-		Slug:       "demo",
+		Slug:       "", // Omit --slug: must auto-derive from hailiang01.onmicrosoft.com!
 		SecretDays: 7,
 		Apply:      true,
 		OutputPath: bundlePath,
@@ -181,6 +193,12 @@ func TestOnboardApplyAutoDiscoversSubscriptionsAndWritesChmod600Bundle(t *testin
 	})
 	if err != nil {
 		t.Fatalf("apply failed: %v", err)
+	}
+	if sum.Slug != "hailiang01" || sum.AppName != "rax-managed-sp-hailiang01" {
+		t.Fatalf("expected auto-derived slug hailiang01 from *.onmicrosoft.com, got slug=%q appName=%q", sum.Slug, sum.AppName)
+	}
+	if sum.TenantDomain != "hailiang01.onmicrosoft.com" || sum.AuthorizedByEmail != "admin@example.com" || sum.TenantDisplayName != "HaiLiang Cloud" {
+		t.Fatalf("expected tenantDomain/authorizedByEmail/displayName populated, got %+v", sum)
 	}
 	hasDeviceCodeEvent := false
 	for _, ev := range events {

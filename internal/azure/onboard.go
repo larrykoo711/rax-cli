@@ -56,37 +56,43 @@ type OnboardBundleSubscription struct {
 
 // OnboardBundle is written chmod 0600 for direct import into Rax Console.
 type OnboardBundle struct {
-	Schema          string                      `json:"schema"`
-	TenantID        string                      `json:"tenantId"`
-	Slug            string                      `json:"slug"`
-	AppName         string                      `json:"appName"`
-	ClientID        string                      `json:"clientId"`
-	SPObjectID      string                      `json:"spObjectId"`
-	ClientSecret    string                      `json:"clientSecret"`
-	SecretExpiresAt string                      `json:"secretExpiresAt"`
-	FreezeRoleMode  string                      `json:"freezeRoleMode"`
-	Subscriptions   []OnboardBundleSubscription `json:"subscriptions"`
+	Schema            string                      `json:"schema"`
+	TenantID          string                      `json:"tenantId"`
+	Slug              string                      `json:"slug"`
+	AppName           string                      `json:"appName"`
+	TenantDisplayName string                      `json:"tenantDisplayName,omitempty"`
+	TenantDomain      string                      `json:"tenantDomain,omitempty"`
+	AuthorizedByEmail string                      `json:"authorizedByEmail,omitempty"`
+	ClientID          string                      `json:"clientId"`
+	SPObjectID        string                      `json:"spObjectId"`
+	ClientSecret      string                      `json:"clientSecret"`
+	SecretExpiresAt   string                      `json:"secretExpiresAt"`
+	FreezeRoleMode    string                      `json:"freezeRoleMode"`
+	Subscriptions     []OnboardBundleSubscription `json:"subscriptions"`
 }
 
 // OnboardSummary is the sanitized output returned to stdout (never contains raw secret).
 type OnboardSummary struct {
-	OK              bool                        `json:"ok"`
-	Applied         bool                        `json:"applied"`
-	Mode            string                      `json:"mode"`
-	Sealed          bool                        `json:"sealed"`
-	KeyID           string                      `json:"keyId,omitempty"`
-	Verified        bool                        `json:"verified"`
-	TenantID        string                      `json:"tenantId"`
-	Slug            string                      `json:"slug"`
-	AppName         string                      `json:"appName"`
-	ClientID        string                      `json:"clientId,omitempty"`
-	SPObjectID      string                      `json:"spObjectId,omitempty"`
-	SecretMasked    string                      `json:"secretMasked,omitempty"`
-	SecretExpiresAt string                      `json:"secretExpiresAt,omitempty"`
-	FreezeRoleMode  string                      `json:"freezeRoleMode"`
-	RolesPerSub     []string                    `json:"rolesPerSub"`
-	Subscriptions   []OnboardBundleSubscription `json:"subscriptions"`
-	OutputPath      string                      `json:"outputPath,omitempty"`
+	OK                bool                        `json:"ok"`
+	Applied           bool                        `json:"applied"`
+	Mode              string                      `json:"mode"`
+	Sealed            bool                        `json:"sealed"`
+	KeyID             string                      `json:"keyId,omitempty"`
+	Verified          bool                        `json:"verified"`
+	TenantID          string                      `json:"tenantId"`
+	Slug              string                      `json:"slug"`
+	AppName           string                      `json:"appName"`
+	TenantDisplayName string                      `json:"tenantDisplayName,omitempty"`
+	TenantDomain      string                      `json:"tenantDomain,omitempty"`
+	AuthorizedByEmail string                      `json:"authorizedByEmail,omitempty"`
+	ClientID          string                      `json:"clientId,omitempty"`
+	SPObjectID        string                      `json:"spObjectId,omitempty"`
+	SecretMasked      string                      `json:"secretMasked,omitempty"`
+	SecretExpiresAt   string                      `json:"secretExpiresAt,omitempty"`
+	FreezeRoleMode    string                      `json:"freezeRoleMode"`
+	RolesPerSub       []string                    `json:"rolesPerSub"`
+	Subscriptions     []OnboardBundleSubscription `json:"subscriptions"`
+	OutputPath        string                      `json:"outputPath,omitempty"`
 }
 
 // Onboarder coordinates Entra Device Code auth, Graph App/SP provisioning, and ARM RBAC binding.
@@ -139,10 +145,7 @@ func MaskSecret(secret string) string {
 
 // Run executes dry-run planning or full Device Code onboarding against Azure.
 func (o *Onboarder) Run(ctx context.Context, opts OnboardOptions) (*OnboardSummary, error) {
-	slug := strings.TrimSpace(opts.Slug)
-	if slug == "" {
-		return nil, errors.New("--slug is required (e.g. --slug hailiang01)")
-	}
+	explicitSlug := strings.TrimSpace(opts.Slug)
 	if opts.SecretDays == 0 {
 		opts.SecretDays = 365
 	}
@@ -171,10 +174,16 @@ func (o *Onboarder) Run(ctx context.Context, opts OnboardOptions) (*OnboardSumma
 		}
 	}
 
-	appName := SPDisplayName(slug)
 	roles := RequiredRoles(freezeMode)
 
 	if !opts.Apply {
+		previewSlug := explicitSlug
+		previewAppName := "rax-managed-sp-<auto-from-domain>"
+		if previewSlug != "" {
+			previewAppName = SPDisplayName(previewSlug)
+		} else {
+			previewSlug = "auto"
+		}
 		plannedSubs := make([]OnboardBundleSubscription, 0, len(opts.Subscriptions))
 		for _, id := range opts.Subscriptions {
 			clean := strings.TrimSpace(id)
@@ -188,7 +197,7 @@ func (o *Onboarder) Run(ctx context.Context, opts OnboardOptions) (*OnboardSumma
 				Roles:          roles,
 			})
 		}
-		plannedOut := ResolveOutputPath(opts.OutputPath, slug, nowFn().UTC(), opts.PlainOutput)
+		plannedOut := ResolveOutputPath(opts.OutputPath, previewSlug, nowFn().UTC(), opts.PlainOutput)
 		return &OnboardSummary{
 			OK:             true,
 			Applied:        false,
@@ -196,8 +205,8 @@ func (o *Onboarder) Run(ctx context.Context, opts OnboardOptions) (*OnboardSumma
 			Sealed:         !opts.PlainOutput,
 			KeyID:          effectiveKeyID(opts.SealKeyID, opts.PlainOutput),
 			TenantID:       strings.TrimSpace(opts.TenantID),
-			Slug:           slug,
-			AppName:        appName,
+			Slug:           previewSlug,
+			AppName:        previewAppName,
 			FreezeRoleMode: freezeMode,
 			RolesPerSub:    roles,
 			Subscriptions:  plannedSubs,
@@ -248,6 +257,31 @@ func (o *Onboarder) Run(ctx context.Context, opts OnboardOptions) (*OnboardSumma
 	graphTok, err := o.Auth.RefreshForScope(ctx, resolvedTenantID, armTok.RefreshToken, ScopeGraph)
 	if err != nil {
 		return nil, fmt.Errorf("acquire Microsoft Graph token: %w", err)
+	}
+
+	// Resolve signed-in admin email and tenant *.onmicrosoft.com domain to auto-derive slug when omitted.
+	authorizedEmail := claims.ResolvedEmail()
+	if authorizedEmail == "" && armTok.IDToken != "" {
+		if idClaims, idErr := ParseJWTClaims(armTok.IDToken); idErr == nil {
+			authorizedEmail = idClaims.ResolvedEmail()
+		}
+	}
+	if authorizedEmail == "" {
+		if gClaims, gErr := ParseJWTClaims(graphTok.AccessToken); gErr == nil {
+			authorizedEmail = gClaims.ResolvedEmail()
+		}
+	}
+
+	orgInfo, _ := o.Graph.GetOrganizationInfo(ctx, graphTok.AccessToken)
+	autoSlug, tenantDomain := DeriveTenantSlug(orgInfo, authorizedEmail, resolvedTenantID)
+	slug := explicitSlug
+	if slug == "" {
+		slug = autoSlug
+	}
+	appName := SPDisplayName(slug)
+	tenantDisplayName := ""
+	if orgInfo != nil && orgInfo.DisplayName != "" {
+		tenantDisplayName = orgInfo.DisplayName
 	}
 
 	// Step 2: Discover enabled subscriptions under this tenant (or filter to explicit list).
@@ -355,16 +389,19 @@ func (o *Onboarder) Run(ctx context.Context, opts OnboardOptions) (*OnboardSumma
 	}
 
 	bundle := OnboardBundle{
-		Schema:          "rax-azure-tenant-bundle/v1",
-		TenantID:        resolvedTenantID,
-		Slug:            slug,
-		AppName:         appName,
-		ClientID:        app.AppID,
-		SPObjectID:      sp.ObjectID,
-		ClientSecret:    cred.SecretText,
-		SecretExpiresAt: expiresAtISO,
-		FreezeRoleMode:  freezeMode,
-		Subscriptions:   assigned,
+		Schema:            "rax-azure-tenant-bundle/v1",
+		TenantID:          resolvedTenantID,
+		Slug:              slug,
+		AppName:           appName,
+		TenantDisplayName: tenantDisplayName,
+		TenantDomain:      tenantDomain,
+		AuthorizedByEmail: authorizedEmail,
+		ClientID:          app.AppID,
+		SPObjectID:        sp.ObjectID,
+		ClientSecret:      cred.SecretText,
+		SecretExpiresAt:   expiresAtISO,
+		FreezeRoleMode:    freezeMode,
+		Subscriptions:     assigned,
 	}
 
 	outPath := ResolveOutputPath(opts.OutputPath, slug, now, opts.PlainOutput)
@@ -390,23 +427,26 @@ func (o *Onboarder) Run(ctx context.Context, opts OnboardOptions) (*OnboardSumma
 	}
 
 	return &OnboardSummary{
-		OK:              true,
-		Applied:         true,
-		Mode:            "apply",
-		Sealed:          sealedMode,
-		KeyID:           keyID,
-		Verified:        verified,
-		TenantID:        resolvedTenantID,
-		Slug:            slug,
-		AppName:         appName,
-		ClientID:        app.AppID,
-		SPObjectID:      sp.ObjectID,
-		SecretMasked:    MaskSecret(cred.SecretText),
-		SecretExpiresAt: expiresAtISO,
-		FreezeRoleMode:  freezeMode,
-		RolesPerSub:     roles,
-		Subscriptions:   assigned,
-		OutputPath:      outPath,
+		OK:                true,
+		Applied:           true,
+		Mode:              "apply",
+		Sealed:            sealedMode,
+		KeyID:             keyID,
+		Verified:          verified,
+		TenantID:          resolvedTenantID,
+		Slug:              slug,
+		AppName:           appName,
+		TenantDisplayName: tenantDisplayName,
+		TenantDomain:      tenantDomain,
+		AuthorizedByEmail: authorizedEmail,
+		ClientID:          app.AppID,
+		SPObjectID:        sp.ObjectID,
+		SecretMasked:      MaskSecret(cred.SecretText),
+		SecretExpiresAt:   expiresAtISO,
+		FreezeRoleMode:    freezeMode,
+		RolesPerSub:       roles,
+		Subscriptions:     assigned,
+		OutputPath:        outPath,
 	}, nil
 }
 

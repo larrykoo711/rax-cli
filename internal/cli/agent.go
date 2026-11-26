@@ -70,9 +70,9 @@ func (a App) runAgentInfo() int {
 		},
 		"commands": []map[string]any{
 			{
-				"command": "rax azure onboard",
-				"purpose": "Native Entra Device Code onboarding: auto-discovers enabled subscriptions, provisions single-tenant SP + least-privilege RBAC, self-verifies in memory, and writes a sealed encrypted bundle to ~/Downloads/rax-cli/.",
-				"agentInvocation": "rax azure onboard --slug <slug> --secret-days <7|30|90|180|365> --agent --apply",
+				"command":         "rax azure onboard",
+				"purpose":         "Native Entra Device Code onboarding: auto-detects tenant domain slug & admin email, discovers enabled subscriptions, provisions single-tenant SP + unified least-privilege RBAC, self-verifies in memory, and writes an encrypted bundle to ~/Downloads/rax-cli/.",
+				"agentInvocation": "rax azure onboard --secret-days <7|30|90|180|365> --agent --apply",
 				"agentProtocol": map[string]any{
 					"format":             "NDJSON on stdout (one JSON object per line, flushed immediately)",
 					"events":             []string{"step", "device_code", "done", "error"},

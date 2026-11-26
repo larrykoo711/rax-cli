@@ -56,7 +56,7 @@ func (a App) runAzureOnboard(ctx context.Context, args []string) int {
 	)
 
 	fs.StringVar(&tenantID, "tenant", "", "Optional Azure Entra Tenant ID (auto-detected after Device Code sign-in if omitted)")
-	fs.StringVar(&slug, "slug", "", "Short tenant slug used to name SP (e.g. hailiang01 -> rax-managed-sp-hailiang01)")
+	fs.StringVar(&slug, "slug", "", "Optional short tenant slug (auto-derived from tenant *.onmicrosoft.com domain if omitted)")
 	fs.StringVar(&subsCSV, "subscriptions", "", "Optional comma-separated Subscription IDs (auto-discovers all enabled subscriptions if omitted)")
 	fs.StringVar(&freezeRole, "freeze-role", "custom", "Freeze role mode: 'custom' (least-privilege default) or 'builtin'")
 	fs.IntVar(&secretDays, "secret-days", 365, "Client secret validity in days (7-730)")
@@ -88,17 +88,17 @@ func (a App) runAzureOnboard(ctx context.Context, args []string) int {
 		}
 	}
 
-	if strings.TrimSpace(slug) == "" {
+	if secretDays < 7 || secretDays > 730 {
 		if agentMode || asJSON {
 			writeNDJSON(agentError{
 				OK:    false,
 				Event: "error",
 				Code:  "INVALID_ARGUMENT",
-				Error: "--slug is required",
-				Hint:  "Pass --slug <name> (e.g. rax azure onboard --slug prod --agent --apply)",
+				Error: fmt.Sprintf("--secret-days must be between 7 and 730 (got %d)", secretDays),
+				Hint:  "Use a valid secret lifetime such as --secret-days 365",
 			})
 		} else {
-			fmt.Fprintf(a.Stderr, "Error: --slug is required (example: rax azure onboard --slug prod --apply)\n")
+			fmt.Fprintf(a.Stderr, "Error: --secret-days must be between 7 and 730 (got %d)\n", secretDays)
 		}
 		return ExitInvalidArg
 	}
@@ -209,6 +209,12 @@ func (a App) runAzureOnboard(ctx context.Context, args []string) int {
 
 	fmt.Fprintf(a.Stdout, "\nAzure tenant onboarded successfully:\n")
 	fmt.Fprintf(a.Stdout, "  Tenant ID:      %s\n", summary.TenantID)
+	if summary.TenantDomain != "" {
+		fmt.Fprintf(a.Stdout, "  Tenant Domain:  %s\n", summary.TenantDomain)
+	}
+	if summary.AuthorizedByEmail != "" {
+		fmt.Fprintf(a.Stdout, "  Authorized By:  %s\n", summary.AuthorizedByEmail)
+	}
 	fmt.Fprintf(a.Stdout, "  SP Name:        %s\n", summary.AppName)
 	fmt.Fprintf(a.Stdout, "  Client ID:      %s\n", summary.ClientID)
 	if summary.Sealed {
