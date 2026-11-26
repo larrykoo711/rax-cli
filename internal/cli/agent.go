@@ -3,11 +3,14 @@ package cli
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"runtime"
 	"strings"
 	"time"
+
+	"github.com/larrykoo711/rax-cli/internal/azure"
 )
 
 // Exit codes standardized for AI agent harnesses.
@@ -20,16 +23,38 @@ const (
 )
 
 type agentError struct {
-	OK    bool   `json:"ok"`
-	Event string `json:"event,omitempty"`
-	Code  string `json:"code"`
-	Error string `json:"error"`
-	Hint  string `json:"hint,omitempty"`
+	OK            bool   `json:"ok"`
+	Event         string `json:"event,omitempty"`
+	Code          string `json:"code"`
+	Error         string `json:"error"`
+	Hint          string `json:"hint,omitempty"`
+	Step          string `json:"step,omitempty"`
+	Completed     int    `json:"completed,omitempty"`
+	Total         int    `json:"total,omitempty"`
+	Pending       int    `json:"pending,omitempty"`
+	SecretCreated *bool  `json:"secretCreated,omitempty"`
+	Resumable     bool   `json:"resumable,omitempty"`
+	TimeoutKind   string `json:"timeoutKind,omitempty"`
+	LogFile       string `json:"logFile,omitempty"`
 }
 
 func classifyAzureError(err error) (exitCode int, code string, hint string) {
 	if err == nil {
 		return ExitOK, "", ""
+	}
+	var failErr *azure.OnboardFailureError
+	if errors.As(err, &failErr) {
+		switch failErr.TimeoutKind {
+		case "device_code":
+			return ExitAuthFailed, "DEVICE_CODE_EXPIRED", "Browser sign-in timed out before completing Device Code auth. Re-run the command to get a fresh code."
+		case "request":
+			return ExitError, "ARM_REQUEST_TIMEOUT", "An Azure ARM request timed out after bounded retries. Re-running the exact same command safely resumes idempotently without duplicating roles. Run `rax logs bundle --json` to package diagnostics."
+		case "overall":
+			return ExitError, "OPERATION_TIMEOUT", "Overall --timeout deadline was exceeded (try --timeout 30m for 50+ subscriptions). Re-running safely resumes idempotently. Run `rax logs bundle --json` to package diagnostics."
+		}
+	}
+	if errors.Is(err, context.Canceled) {
+		return ExitError, "CANCELLED", "Operation was cancelled by the caller. Re-running the same command safely resumes idempotently."
 	}
 	msg := strings.ToLower(err.Error())
 	switch {
@@ -38,7 +63,7 @@ func classifyAzureError(err error) (exitCode int, code string, hint string) {
 	case strings.Contains(msg, "http 403") || strings.Contains(msg, "authorizationfailed") || strings.Contains(msg, "forbidden") || strings.Contains(msg, "insufficient"):
 		return ExitPermission, "PERMISSION_DENIED", "The signed-in Azure account needs Application Administrator (or App creation) in Entra ID and Owner / User Access Administrator on the target subscriptions."
 	default:
-		return ExitError, "EXECUTION_FAILED", "Inspect the error message and run `rax doctor --json` to verify network reachability."
+		return ExitError, "EXECUTION_FAILED", "Re-running the exact same command safely resumes idempotently. Run `rax logs bundle --json` to collect redacted diagnostics for the Rax team."
 	}
 }
 
@@ -71,13 +96,19 @@ func (a App) runAgentInfo() int {
 		"commands": []map[string]any{
 			{
 				"command":         "rax azure onboard",
-				"purpose":         "Native Entra Device Code onboarding: auto-detects tenant domain slug & admin email, discovers enabled subscriptions, provisions single-tenant SP + unified least-privilege RBAC, self-verifies in memory, and writes an encrypted bundle to ~/Downloads/rax-cli/.",
+				"purpose":         "Native Entra Device Code onboarding: auto-detects tenant domain slug & admin email, discovers enabled subscriptions, provisions single-tenant SP + unified least-privilege RBAC with bounded concurrency & idempotent retries, self-verifies in memory, and writes an encrypted bundle to ~/Downloads/rax-cli/.",
 				"agentInvocation": "rax azure onboard --secret-days <7|30|90|180|365> --agent --apply",
 				"agentProtocol": map[string]any{
 					"format":             "NDJSON on stdout (one JSON object per line, flushed immediately)",
-					"events":             []string{"step", "device_code", "done", "error"},
+					"events":             []string{"step", "device_code", "progress", "retry", "done", "error"},
 					"actionOnDeviceCode": "Relay verificationUri and userCode to the human immediately and wait for the process to finish.",
+					"actionOnError":      "Run `rax logs bundle --json` to generate a redacted diagnostic report in ~/Downloads/rax-cli/ and share its path with the human. Re-running onboard is safely idempotent.",
 				},
+			},
+			{
+				"command":         "rax logs bundle",
+				"purpose":         "Collect recent redacted run logs and connectivity probes into a single secret-free diagnostic report in ~/Downloads/rax-cli/.",
+				"agentInvocation": "rax logs bundle --json",
 			},
 			{
 				"command":         "rax azure verify",

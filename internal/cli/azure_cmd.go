@@ -3,6 +3,7 @@ package cli
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -66,7 +67,7 @@ func (a App) runAzureOnboard(ctx context.Context, args []string) int {
 	fs.StringVar(&sealKeyPath, "seal-key", "", "Optional path to a custom SPKI RSA public key PEM for sealing")
 	fs.BoolVar(&asJSON, "json", false, "Print structured JSON summary to stdout")
 	fs.BoolVar(&agentMode, "agent", os.Getenv("RAX_AGENT") == "1", "Emit line-flushed NDJSON progress & device_code events for AI agents")
-	fs.DurationVar(&timeout, "timeout", 15*time.Minute, "Overall operation timeout including Device Code sign-in")
+	fs.DurationVar(&timeout, "timeout", 30*time.Minute, "Overall operation timeout including Device Code sign-in")
 
 	if err := fs.Parse(args); err != nil {
 		if err == flag.ErrHelp {
@@ -124,14 +125,42 @@ func (a App) runAzureOnboard(ctx context.Context, args []string) int {
 		}
 	}
 
+	var recorder *RunRecorder
+	if apply {
+		recorder = a.StartRunRecorder("azure onboard")
+	}
+
 	var logWriter io.Writer = a.Stderr
-	var onEvent func(azure.OnboardEvent)
+	onEvent := func(ev azure.OnboardEvent) {
+		if recorder != nil {
+			level := "info"
+			if ev.Event == "retry" {
+				level = "warn"
+			}
+			msg := ev.Message
+			if ev.Event == "device_code" {
+				msg = "Device code issued (code redacted)"
+			}
+			recorder.Record(LogEntry{
+				Level:             level,
+				Event:             ev.Event,
+				Step:              ev.Step,
+				Completed:         ev.Completed,
+				Total:             ev.Total,
+				Attempt:           ev.Attempt,
+				MaxAttempts:       ev.MaxAttempts,
+				Reason:            ev.Reason,
+				RetryAfterSeconds: ev.RetryAfterSeconds,
+				Message:           msg,
+			})
+		}
+		if agentMode {
+			writeNDJSON(ev)
+		}
+	}
 	if agentMode {
 		// In --agent mode, keep stdout strictly NDJSON and silence human stderr noise.
 		logWriter = io.Discard
-		onEvent = func(ev azure.OnboardEvent) {
-			writeNDJSON(ev)
-		}
 	}
 
 	onboarder := azure.NewOnboarder()
@@ -150,19 +179,53 @@ func (a App) runAzureOnboard(ctx context.Context, args []string) int {
 	})
 	if err != nil {
 		exitCode, code, hint := classifyAzureError(err)
+		var (
+			step          string
+			completed     int
+			total         int
+			pending       int
+			secretCreated *bool
+			resumable     bool
+			timeoutKind   string
+		)
+		var failErr *azure.OnboardFailureError
+		if errors.As(err, &failErr) {
+			step = failErr.Step
+			completed = failErr.Completed
+			total = failErr.Total
+			pending = failErr.Pending
+			sc := failErr.SecretCreated
+			secretCreated = &sc
+			resumable = failErr.Resumable
+			timeoutKind = failErr.TimeoutKind
+		}
+		recorder.Finish(exitCode, code, timeoutKind, err.Error(), completed, total, pending, secretCreated)
 		if agentMode || asJSON {
 			writeNDJSON(agentError{
-				OK:    false,
-				Event: "error",
-				Code:  code,
-				Error: err.Error(),
-				Hint:  hint,
+				OK:            false,
+				Event:         "error",
+				Code:          code,
+				Error:         err.Error(),
+				Hint:          hint,
+				Step:          step,
+				Completed:     completed,
+				Total:         total,
+				Pending:       pending,
+				SecretCreated: secretCreated,
+				Resumable:     resumable,
+				TimeoutKind:   timeoutKind,
+				LogFile:       recorder.Path(),
 			})
 		} else {
-			fmt.Fprintf(a.Stderr, "Error: %v\n", err)
+			fmt.Fprintf(a.Stderr, "Error: %v\nHint:  %s\n", err, hint)
+			if p := recorder.Path(); p != "" {
+				fmt.Fprintf(a.Stderr, "Logs:  run `rax logs bundle` to export a redacted diagnostic report (raw log: %s)\n", p)
+			}
 		}
 		return exitCode
 	}
+	scTrue := true
+	recorder.Finish(ExitOK, "", "", fmt.Sprintf("Onboarded %d subscription(s)", len(summary.Subscriptions)), len(summary.Subscriptions), len(summary.Subscriptions), 0, &scTrue)
 
 	if agentMode {
 		nextStep := fmt.Sprintf(
