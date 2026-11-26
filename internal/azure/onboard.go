@@ -264,7 +264,7 @@ func (o *Onboarder) Run(ctx context.Context, opts OnboardOptions) (*OnboardSumma
 	emit(OnboardEvent{Event: "step", Step: "2/5", TenantID: resolvedTenantID, Subscriptions: len(targetSubs), Message: fmt.Sprintf("Found %d target subscription(s)", len(targetSubs))})
 	fmt.Fprintf(logOut, "      Found %d target subscription(s).\n", len(targetSubs))
 
-	// Step 3: Idempotently create single-tenant App Registration, Service Principal, and Client Secret.
+	// Step 3: Idempotently create single-tenant App Registration & Service Principal (no secret minted yet).
 	emit(OnboardEvent{Event: "step", Step: "3/5", TenantID: resolvedTenantID, Message: fmt.Sprintf("Provisioning single-tenant App & SP (%s)", appName)})
 	fmt.Fprintf(logOut, "[3/5] Provisioning single-tenant App & Service Principal (%s)...\n", appName)
 	app, _, err := o.Graph.EnsureApplication(ctx, graphTok.AccessToken, appName)
@@ -275,29 +275,30 @@ func (o *Onboarder) Run(ctx context.Context, opts OnboardOptions) (*OnboardSumma
 	if err != nil {
 		return nil, err
 	}
-	now := nowFn().UTC()
-	endTime := now.Add(time.Duration(opts.SecretDays) * 24 * time.Hour)
-	cred, err := o.Graph.AddClientSecret(ctx, graphTok.AccessToken, app.ObjectID, "rax-managed-"+now.Format("20060102"), now, endTime)
-	if err != nil {
-		return nil, err
-	}
-	expiresAtISO := cred.EndDateTime
-	if strings.TrimSpace(expiresAtISO) == "" {
-		expiresAtISO = endTime.Format(time.RFC3339)
-	}
 
-	// Step 4: Bind 4 read roles + 1 freeze role per subscription.
+	// Step 4: Ensure ONE tenant-unique custom freeze role covering all target subscriptions,
+	// then bind 4 read roles + 1 freeze role per subscription BEFORE minting any Client Secret.
 	emit(OnboardEvent{Event: "step", Step: "4/5", TenantID: resolvedTenantID, Subscriptions: len(targetSubs), Message: "Binding least-privilege RBAC roles"})
 	fmt.Fprintf(logOut, "[4/5] Binding least-privilege RBAC roles across %d subscription(s)...\n", len(targetSubs))
+	targetSubIDs := make([]string, 0, len(targetSubs))
+	for _, sub := range targetSubs {
+		targetSubIDs = append(targetSubIDs, sub.SubscriptionID)
+	}
+
+	var sharedCustomFreezeRoleID string
+	if freezeMode == "custom" {
+		sharedCustomFreezeRoleID, _, err = o.ARM.EnsureCustomFreezeRoleForSubscriptions(ctx, armTok.AccessToken, resolvedTenantID, targetSubIDs)
+		if err != nil {
+			return nil, err
+		}
+	}
+
 	assigned := make([]OnboardBundleSubscription, 0, len(targetSubs))
 	for _, sub := range targetSubs {
 		var freezeRoleDefID string
 		var freezeRoleName string
 		if freezeMode == "custom" {
-			freezeRoleDefID, _, err = o.ARM.EnsureCustomFreezeRole(ctx, armTok.AccessToken, sub.SubscriptionID)
-			if err != nil {
-				return nil, err
-			}
+			freezeRoleDefID = sharedCustomFreezeRoleID
 			freezeRoleName = CustomFreezeRoleName
 		} else {
 			freezeRoleDefID, err = o.ARM.FindRoleDefinitionID(ctx, armTok.AccessToken, sub.SubscriptionID, FallbackFreezeRoleName)
@@ -331,7 +332,19 @@ func (o *Onboarder) Run(ctx context.Context, opts OnboardOptions) (*OnboardSumma
 		})
 	}
 
-	// Step 5: Self-verify SP tokens in-memory (best-effort) before sealing, then write encrypted bundle to ~/Downloads/rax-cli/.
+	// Step 5: Only after all RBAC bindings succeed, mint Client Secret, self-verify in memory,
+	// seal with Rax platform RSA-2048 public key, and write to ~/Downloads/rax-cli/.
+	now := nowFn().UTC()
+	endTime := now.Add(time.Duration(opts.SecretDays) * 24 * time.Hour)
+	cred, err := o.Graph.AddClientSecret(ctx, graphTok.AccessToken, app.ObjectID, "rax-managed-"+now.Format("20060102"), now, endTime)
+	if err != nil {
+		return nil, err
+	}
+	expiresAtISO := cred.EndDateTime
+	if strings.TrimSpace(expiresAtISO) == "" {
+		expiresAtISO = endTime.Format(time.RFC3339)
+	}
+
 	verified := false
 	if vRes, vErr := o.Verify(ctx, VerifyCredentials{
 		TenantID:     resolvedTenantID,

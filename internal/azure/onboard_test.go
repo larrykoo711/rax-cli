@@ -61,6 +61,8 @@ func TestOnboardApplyAutoDiscoversSubscriptionsAndWritesChmod600Bundle(t *testin
 	var pollCount int32
 	var roleAssignments int32
 	var customRolesCreated int32
+	var secretAddedAfterAssignments int32
+	var lastAssignableScopes []string
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -97,6 +99,7 @@ func TestOnboardApplyAutoDiscoversSubscriptionsAndWritesChmod600Bundle(t *testin
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"value": []map[string]string{
 					{"subscriptionId": "sub-1", "displayName": "Prod Sub 1", "state": "Enabled", "tenantId": tenantID},
+					{"subscriptionId": "sub-2", "displayName": "Prod Sub 2", "state": "Enabled", "tenantId": tenantID},
 					{"subscriptionId": "sub-disabled", "displayName": "Old Sub", "state": "Disabled", "tenantId": tenantID},
 				},
 			})
@@ -116,6 +119,9 @@ func TestOnboardApplyAutoDiscoversSubscriptionsAndWritesChmod600Bundle(t *testin
 				"appId": "app-client-1",
 			})
 		case r.Method == http.MethodPost && r.URL.Path == "/applications/app-oid-1/addPassword":
+			if atomic.LoadInt32(&roleAssignments) >= 10 {
+				atomic.StoreInt32(&secretAddedAfterAssignments, 1)
+			}
 			_ = json.NewEncoder(w).Encode(map[string]string{
 				"secretText":  "super-secret-value-9876",
 				"endDateTime": "2027-11-26T00:00:00Z",
@@ -130,6 +136,13 @@ func TestOnboardApplyAutoDiscoversSubscriptionsAndWritesChmod600Bundle(t *testin
 			})
 		case r.Method == http.MethodPut && strings.Contains(r.URL.Path, "/roleDefinitions/"):
 			atomic.AddInt32(&customRolesCreated, 1)
+			var body struct {
+				Properties struct {
+					AssignableScopes []string `json:"assignableScopes"`
+				} `json:"properties"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			lastAssignableScopes = body.Properties.AssignableScopes
 			_ = json.NewEncoder(w).Encode(map[string]string{"id": r.URL.Path})
 		case r.Method == http.MethodPut && strings.Contains(r.URL.Path, "/roleAssignments/"):
 			if atomic.AddInt32(&roleAssignments, 1) == 1 {
@@ -184,15 +197,23 @@ func TestOnboardApplyAutoDiscoversSubscriptionsAndWritesChmod600Bundle(t *testin
 	if sum.SecretMasked != "***9876" {
 		t.Fatalf("expected masked secret ***9876, got %s", sum.SecretMasked)
 	}
-	if len(sum.Subscriptions) != 1 || sum.Subscriptions[0].ID != "sub-1" || sum.Subscriptions[0].Name != "Prod Sub 1" {
-		t.Fatalf("expected 1 enabled auto-discovered subscription, got %+v", sum.Subscriptions)
+	if len(sum.Subscriptions) != 2 || sum.Subscriptions[0].ID != "sub-1" || sum.Subscriptions[1].ID != "sub-2" {
+		t.Fatalf("expected 2 enabled auto-discovered subscriptions, got %+v", sum.Subscriptions)
 	}
+	// Multi-subscription tenant must create ONLY ONE directory-unique custom freeze role covering BOTH subs.
 	if atomic.LoadInt32(&customRolesCreated) != 1 {
-		t.Fatalf("expected 1 custom role created, got %d", customRolesCreated)
+		t.Fatalf("expected exactly 1 tenant-unique custom role created across 2 subs, got %d", customRolesCreated)
 	}
-	// 5 roles + 1 simulated PrincipalNotFound retry = 6 PUT calls
-	if atomic.LoadInt32(&roleAssignments) != 6 {
-		t.Fatalf("expected 6 role assignment calls (5 + 1 retry), got %d", roleAssignments)
+	if len(lastAssignableScopes) != 2 || lastAssignableScopes[0] != "/subscriptions/sub-1" || lastAssignableScopes[1] != "/subscriptions/sub-2" {
+		t.Fatalf("expected assignableScopes for both subscriptions, got %+v", lastAssignableScopes)
+	}
+	// 2 subs * 5 roles + 1 simulated PrincipalNotFound retry = 11 PUT calls
+	if atomic.LoadInt32(&roleAssignments) != 11 {
+		t.Fatalf("expected 11 role assignment calls (10 + 1 retry), got %d", roleAssignments)
+	}
+	// Secret must be minted strictly AFTER all RBAC assignments succeed.
+	if atomic.LoadInt32(&secretAddedAfterAssignments) != 1 {
+		t.Fatalf("expected client secret to be created strictly after RBAC assignments succeed")
 	}
 
 	info, err := os.Stat(bundlePath)

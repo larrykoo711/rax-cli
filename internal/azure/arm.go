@@ -155,7 +155,8 @@ func (c *ARMClient) ListSubscriptions(ctx context.Context, token string) ([]Subs
 
 // CustomFreezeRolePayload builds the least-privilege ARM custom role definition payload
 // permitting only publicNetworkAccess toggles while explicitly denying delete and key access.
-func CustomFreezeRolePayload(subscriptionID string) map[string]any {
+// AssignableScopes includes all target subscriptions so one tenant-wide roleName suffices.
+func CustomFreezeRolePayload(assignableScopes []string) map[string]any {
 	return map[string]any{
 		"properties": map[string]any{
 			"roleName": CustomFreezeRoleName,
@@ -177,13 +178,19 @@ func CustomFreezeRolePayload(subscriptionID string) map[string]any {
 					"notDataActions": []string{},
 				},
 			},
-			"assignableScopes": []string{"/subscriptions/" + subscriptionID},
+			"assignableScopes": assignableScopes,
 		},
 	}
 }
 
-// FindRoleDefinitionID resolves the full ARM roleDefinitionId for a named role on a subscription.
-func (c *ARMClient) FindRoleDefinitionID(ctx context.Context, token, subscriptionID, roleName string) (string, error) {
+// RoleDefinitionInfo holds a discovered ARM role definition ID and its assignableScopes.
+type RoleDefinitionInfo struct {
+	ID               string
+	AssignableScopes []string
+}
+
+// FindRoleDefinition looks up a role definition by exact roleName on a subscription.
+func (c *ARMClient) FindRoleDefinition(ctx context.Context, token, subscriptionID, roleName string) (*RoleDefinitionInfo, error) {
 	escaped := strings.ReplaceAll(roleName, "'", "''")
 	q := url.Values{}
 	q.Set("api-version", armAuthAPIVersion)
@@ -197,36 +204,104 @@ func (c *ARMClient) FindRoleDefinitionID(ctx context.Context, token, subscriptio
 
 	var resp struct {
 		Value []struct {
-			ID string `json:"id"`
+			ID         string `json:"id"`
+			Properties struct {
+				AssignableScopes []string `json:"assignableScopes"`
+			} `json:"properties"`
 		} `json:"value"`
 	}
 	if err := c.doJSON(ctx, token, http.MethodGet, endpoint, nil, &resp); err != nil {
-		return "", err
+		return nil, err
 	}
 	if len(resp.Value) > 0 && resp.Value[0].ID != "" {
-		return resp.Value[0].ID, nil
+		return &RoleDefinitionInfo{
+			ID:               resp.Value[0].ID,
+			AssignableScopes: resp.Value[0].Properties.AssignableScopes,
+		}, nil
 	}
 	if guid, ok := builtinRoleGUIDs[roleName]; ok {
-		return fmt.Sprintf("/subscriptions/%s/providers/Microsoft.Authorization/roleDefinitions/%s", subscriptionID, guid), nil
+		return &RoleDefinitionInfo{
+			ID: fmt.Sprintf("/subscriptions/%s/providers/Microsoft.Authorization/roleDefinitions/%s", subscriptionID, guid),
+		}, nil
 	}
-	return "", nil
+	return nil, nil
 }
 
-// EnsureCustomFreezeRole idempotently ensures the least-privilege custom freeze role exists on the subscription.
-func (c *ARMClient) EnsureCustomFreezeRole(ctx context.Context, token, subscriptionID string) (string, bool, error) {
-	existingID, err := c.FindRoleDefinitionID(ctx, token, subscriptionID, CustomFreezeRoleName)
-	if err != nil {
-		return "", false, fmt.Errorf("lookup custom freeze role on %s: %w", subscriptionID, err)
+// FindRoleDefinitionID resolves the full ARM roleDefinitionId for a named role on a subscription.
+func (c *ARMClient) FindRoleDefinitionID(ctx context.Context, token, subscriptionID, roleName string) (string, error) {
+	info, err := c.FindRoleDefinition(ctx, token, subscriptionID, roleName)
+	if err != nil || info == nil {
+		return "", err
 	}
-	if existingID != "" {
-		return existingID, false, nil
+	return info.ID, nil
+}
+
+// EnsureCustomFreezeRoleForSubscriptions idempotently ensures ONE tenant-unique custom freeze role
+// exists whose assignableScopes covers every target subscription (Microsoft Entra requires custom
+// roleName uniqueness across the entire directory).
+func (c *ARMClient) EnsureCustomFreezeRoleForSubscriptions(ctx context.Context, token, tenantID string, subscriptionIDs []string) (string, bool, error) {
+	if len(subscriptionIDs) == 0 {
+		return "", false, fmt.Errorf("at least one subscription is required for custom freeze role")
 	}
 
-	roleGUID := deterministicUUID("rax-freeze-role:" + strings.ToLower(subscriptionID))
+	targetScopes := make([]string, 0, len(subscriptionIDs))
+	seenTarget := make(map[string]bool, len(subscriptionIDs))
+	for _, id := range subscriptionIDs {
+		clean := strings.TrimSpace(id)
+		if clean == "" {
+			continue
+		}
+		key := strings.ToLower(clean)
+		if !seenTarget[key] {
+			seenTarget[key] = true
+			targetScopes = append(targetScopes, "/subscriptions/"+clean)
+		}
+	}
+
+	// Look up whether the directory-unique custom role already exists on any target subscription.
+	var existing *RoleDefinitionInfo
+	for _, subID := range subscriptionIDs {
+		info, err := c.FindRoleDefinition(ctx, token, subID, CustomFreezeRoleName)
+		if err != nil {
+			return "", false, fmt.Errorf("lookup custom freeze role on %s: %w", subID, err)
+		}
+		if info != nil && info.ID != "" {
+			existing = info
+			break
+		}
+	}
+
+	if existing != nil {
+		merged, changed := mergeScopes(existing.AssignableScopes, targetScopes)
+		if !changed {
+			return existing.ID, false, nil
+		}
+		// Update existing custom role definition in place to include newly onboarded subscriptions.
+		putPath := strings.TrimLeft(existing.ID, "/")
+		endpoint := fmt.Sprintf("%s/%s?api-version=%s", c.baseURL(), putPath, armAuthAPIVersion)
+		var updated struct {
+			ID string `json:"id"`
+		}
+		if err := c.doJSON(ctx, token, http.MethodPut, endpoint, CustomFreezeRolePayload(merged), &updated); err != nil {
+			return "", false, fmt.Errorf("expand custom freeze role assignableScopes (%s): %w", existing.ID, err)
+		}
+		if updated.ID != "" {
+			return updated.ID, false, nil
+		}
+		return existing.ID, false, nil
+	}
+
+	// Create ONE custom role anchored to the first target subscription with all target scopes assignable.
+	anchorSub := strings.TrimSpace(subscriptionIDs[0])
+	seed := strings.ToLower(strings.TrimSpace(tenantID))
+	if seed == "" {
+		seed = strings.ToLower(anchorSub)
+	}
+	roleGUID := deterministicUUID("rax-freeze-role:" + seed)
 	endpoint := fmt.Sprintf(
 		"%s/subscriptions/%s/providers/Microsoft.Authorization/roleDefinitions/%s?api-version=%s",
 		c.baseURL(),
-		url.PathEscape(subscriptionID),
+		url.PathEscape(anchorSub),
 		roleGUID,
 		armAuthAPIVersion,
 	)
@@ -234,13 +309,48 @@ func (c *ARMClient) EnsureCustomFreezeRole(ctx context.Context, token, subscript
 	var created struct {
 		ID string `json:"id"`
 	}
-	if err := c.doJSON(ctx, token, http.MethodPut, endpoint, CustomFreezeRolePayload(subscriptionID), &created); err != nil {
-		return "", false, fmt.Errorf("create custom freeze role on %s: %w", subscriptionID, err)
+	if err := c.doJSON(ctx, token, http.MethodPut, endpoint, CustomFreezeRolePayload(targetScopes), &created); err != nil {
+		return "", false, fmt.Errorf("create custom freeze role on %s: %w", anchorSub, err)
 	}
 	if created.ID == "" {
-		created.ID = fmt.Sprintf("/subscriptions/%s/providers/Microsoft.Authorization/roleDefinitions/%s", subscriptionID, roleGUID)
+		created.ID = fmt.Sprintf("/subscriptions/%s/providers/Microsoft.Authorization/roleDefinitions/%s", anchorSub, roleGUID)
 	}
 	return created.ID, true, nil
+}
+
+// EnsureCustomFreezeRole is a single-subscription convenience wrapper around EnsureCustomFreezeRoleForSubscriptions.
+func (c *ARMClient) EnsureCustomFreezeRole(ctx context.Context, token, subscriptionID string) (string, bool, error) {
+	return c.EnsureCustomFreezeRoleForSubscriptions(ctx, token, "", []string{subscriptionID})
+}
+
+func mergeScopes(existing, required []string) ([]string, bool) {
+	seen := make(map[string]bool, len(existing)+len(required))
+	out := make([]string, 0, len(existing)+len(required))
+	for _, s := range existing {
+		clean := strings.TrimSpace(s)
+		if clean == "" {
+			continue
+		}
+		k := strings.ToLower(clean)
+		if !seen[k] {
+			seen[k] = true
+			out = append(out, clean)
+		}
+	}
+	changed := false
+	for _, s := range required {
+		clean := strings.TrimSpace(s)
+		if clean == "" {
+			continue
+		}
+		k := strings.ToLower(clean)
+		if !seen[k] {
+			seen[k] = true
+			out = append(out, clean)
+			changed = true
+		}
+	}
+	return out, changed
 }
 
 // EnsureRoleAssignment idempotently assigns a role definition to a Service Principal on a subscription,
