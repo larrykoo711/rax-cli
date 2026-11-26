@@ -36,6 +36,7 @@ func (a App) Run(ctx context.Context, args []string) int {
 	case "doctor":
 		return a.runDoctor(ctx, args[1:])
 	case "azure":
+		a.maybeAutoUpdate(ctx, args[1:])
 		return a.runAzure(ctx, args[1:])
 	case "upgrade", "update":
 		return a.runUpgrade(ctx, args[1:])
